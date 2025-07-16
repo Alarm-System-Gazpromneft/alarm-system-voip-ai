@@ -16,6 +16,6 @@ jobs:
           # Создайте PAT с scope `repo` и сохраните его в секретах service-a как MAIN_REPO_PAT.
           token: ${{ secrets.MAIN_REPO_PAT }}
           repository: Alarm-System-Gazpromneft/alarm-system
-          event-type: submodule-backend-pushed
+          event-type: submodule-voip-ai-pushed
           client-payload: |
-            { "submodule": "alarm-system-voip-ai", "commit": "${{ github.sha }}" }
+            { "submodule": "alarm-system-voip-ai", "commit": "${{ github.event.workflow_run.head_commit.message }}" }
