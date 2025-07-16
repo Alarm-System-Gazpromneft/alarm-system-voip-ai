@@ -1,0 +1,21 @@
+name: Notify main repo on push
+
+on:
+  push:
+    branches: [ main ]  # или ваша ветка
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Trigger repository_dispatch in main repo
+        uses: peter-evans/repository-dispatch@v2
+        with:
+          # Токен с правами на запись в основной репозиторий.
+          # Создайте PAT с scope `repo` и сохраните его в секретах service-a как MAIN_REPO_PAT.
+          token: ${{ secrets.MAIN_REPO_PAT }}
+          repository: Alarm-System-Gazpromneft/alarm-system
+          event-type: submodule-backend-pushed
+          client-payload: |
+            { "submodule": "alarm-system-voip-ai", "commit": "${{ github.sha }}" }
