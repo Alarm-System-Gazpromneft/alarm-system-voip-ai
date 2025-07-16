@@ -1,0 +1,15 @@
+kernel/drivers/block/nbd.ko
+kernel/drivers/net/bonding/bonding.ko
+kernel/drivers/net/dummy.ko
+kernel/drivers/net/vrf.ko
+kernel/drivers/usb/serial/usbserial.ko
+kernel/drivers/usb/serial/ch341.ko
+kernel/drivers/usb/serial/cp210x.ko
+kernel/drivers/usb/serial/ftdi_sio.ko
+kernel/sound/drivers/snd-aloop.ko
+kernel/net/netfilter/xt_CT.ko
+kernel/net/netfilter/xt_bpf.ko
+kernel/net/netfilter/xt_u32.ko
+kernel/net/ipv4/ipip.ko
+kernel/net/ipv4/tunnel4.ko
+kernel/net/ipv6/sit.ko

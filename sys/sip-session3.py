@@ -1,0 +1,4235 @@
+#!/usr/bin/python3
+
+import hashlib
+import glob
+import os
+import re
+import signal
+import json
+import sys
+import urllib.request, urllib.parse, urllib.error
+import random
+import requests
+import uuid
+import pgpy
+import subprocess
+import zlib
+
+from collections import defaultdict
+from datetime import datetime, timedelta
+from dateutil.tz import tzlocal
+from itertools import chain
+from lxml import html
+from optparse import OptionParser
+from pathlib import Path
+from threading import Event, Thread, RLock
+from time import sleep
+
+from application import log
+from application.system import makedirs
+from application.notification import IObserver, NotificationCenter, NotificationData
+from application.python.queue import EventQueue
+from application.python import Null
+from eventlib import api
+
+from gnutls.errors import GNUTLSError
+from gnutls.crypto import X509Certificate, X509PrivateKey
+
+from twisted.internet import reactor
+from zope.interface import implementer
+from sipsimple.audio import WaveRecorder
+
+try:
+    from otr import OTRTransport, OTRState, SMPStatus
+    from otr.exceptions import IgnoreMessage, UnencryptedMessage, EncryptedMessageError, OTRError, OTRFinishedError
+except ModuleNotFoundError as e:
+    print('OTR library missing')
+    IgnoreMessage = None
+    pass
+
+from sipsimple.core import Engine, FromHeader, Message, RouteHeader, SIPCoreError, SIPURI, ToHeader
+
+from sipsimple.account import Account, AccountManager, BonjourAccount
+from sipsimple.application import SIPApplication
+from sipsimple.audio import WavePlayer
+from sipsimple.configuration import ConfigurationError
+from sipsimple.configuration.settings import SIPSimpleSettings
+from sipsimple.core import Route
+from sipsimple.core import CORE_REVISION, PJ_VERSION, PJ_SVN_REVISION
+from sipsimple import __version__ as version
+from sipsimple.lookup import DNSLookup
+from sipsimple.payloads.iscomposing import IsComposingMessage, IsComposingDocument
+from sipsimple.session import IllegalStateError, Session
+from sipsimple.streams import MediaStreamRegistry
+from sipsimple.streams.msrp.filetransfer import FileSelector
+from sipsimple.streams.msrp.chat import CPIMPayload, CPIMHeader, CPIMNamespace, SimplePayload, CPIMParserError, ChatIdentity, OTREncryption
+from sipsimple.payloads.imdn import IMDNDocument, DisplayNotification, DeliveryNotification
+
+from sipsimple.storage import FileStorage
+from sipsimple.threading.green import run_in_green_thread
+from sipsimple.util import ISOTimestamp
+
+from sipclient.configuration import config_directory
+from sipclient.configuration.account import AccountExtension, BonjourAccountExtension
+from sipclient.configuration.datatypes import ResourcePath
+from sipclient.configuration.settings import SIPSimpleSettingsExtension
+from sipclient.log import Logger
+from sipclient.system import IPAddressMonitor, copy_default_certificates
+from sipclient.ui import UI # Import only UI, not RichText, Prompt, Question
+
+import socket
+from threading import Thread, Event
+from zope.interface import implementer
+from sipsimple.audio import IAudioPort
+from sipsimple.core import MixerPort, SIPCoreError
+from application.notification import NotificationCenter, NotificationData
+
+try:
+    from sipsimple.audio import IAudioPort
+    from sipsimple.core import MixerPort
+    from application.notification import NotificationCenter, NotificationData
+except ImportError:
+    # Если импорт не удался, создаем заглушки, чтобы код не падал сразу
+    print("КРИТИЧЕСКАЯ ОШИБКА: Не найдены базовые классы sipsimple.audio и sipsimple.core")
+    class IAudioPort: pass
+    class MixerPort: pass
+    class NotificationCenter:
+        def post_notification(self, *args, **kwargs):
+            pass
+    class NotificationData:
+        def __init__(self, *args, **kwargs):
+            pass
+
+@implementer(IAudioPort)
+class UDPPlayerPort(Thread):
+    def __init__(self, mixer, host, port):
+        Thread.__init__(self, daemon=True, name=f"UDPPlayerPort-{host}:{port}")
+        self.mixer = mixer
+        self.host = host
+        self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.stopped = Event()
+        self._player_port = None
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def run(self):
+        try:
+            self.socket.bind((self.host, self.port))
+            self.ui.write(f"[*] UDP Player Port: слушает порт {self.host}:{self.port}")
+        except Exception as e:
+            self.ui.write(f"[!] UDP Player Port: не удалось забиндить порт: {e}")
+            self.stop()
+            return
+        while not self.stopped.is_set():
+            try:
+                data, addr = self.socket.recvfrom(4096)
+                if data and self._player_port and self._player_port.is_active:
+                    self._player_port.write_samples(data)
+            except Exception: break
+        self.socket.close()
+
+    def start(self):
+        if self._player_port is not None: return
+        self._player_port = MixerPort(self.mixer)
+        self._player_port.start()
+        Thread.start(self)
+        notification_center = NotificationCenter()
+        notification_center.post_notification('AudioPortDidChangeSlots', sender=self, data=NotificationData(consumer_slot_changed=False, producer_slot_changed=True, old_producer_slot=None, new_producer_slot=self.producer_slot))
+
+    def stop(self):
+        if self._player_port is None: return
+        old_producer_slot = self.producer_slot
+        self._player_port.stop()
+        self._player_port = None
+        if not self.stopped.is_set():
+            self.stopped.set()
+            try: self.socket.sendto(b'', ('127.0.0.1', self.port))
+            except OSError: pass
+        notification_center = NotificationCenter()
+        notification_center.post_notification('AudioPortDidChangeSlots', sender=self, data=NotificationData(consumer_slot_changed=False, producer_slot_changed=True, old_producer_slot=old_producer_slot, new_producer_slot=None))
+
+    @property
+    def consumer_slot(self): return None
+    @property
+    def producer_slot(self): return self._player_port.slot if self._player_port else None
+
+@implementer(IAudioPort)
+class UDPRecorderPort(object):
+    def __init__(self, mixer, host, port):
+        self.mixer = mixer
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.target_address = (host, port)
+        self._recorder_port = None
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def start(self):
+        if self._recorder_port is not None: return
+        self._recorder_port = MixerPort(self.mixer)
+        self._recorder_port.input_processor = self._handle_audio_frame # Установка callback
+        self._recorder_port.start()
+        notification_center = NotificationCenter()
+        notification_center.post_notification('AudioPortDidChangeSlots', sender=self, data=NotificationData(consumer_slot_changed=True, producer_slot_changed=False, old_consumer_slot=None, new_consumer_slot=self.consumer_slot))
+        self.ui.write(f"[*] UDP Recorder Port: готов отправлять на {self.target_address}")
+
+    def stop(self):
+        if self._recorder_port is None: return
+        old_consumer_slot = self.consumer_slot
+        self._recorder_port.stop()
+        self._recorder_port = None
+        self.socket.close()
+        notification_center = NotificationCenter()
+        notification_center.post_notification('AudioPortDidChangeSlots', sender=self, data=NotificationData(consumer_slot_changed=True, producer_slot_changed=False, old_consumer_slot=old_consumer_slot, new_consumer_slot=None))
+        self.ui.write("[*] UDP Recorder Port: остановлен.")
+
+    def _handle_audio_frame(self, frame):
+        try: self.socket.sendto(frame.data, self.target_address)
+        except Exception: pass
+
+    @property
+    def consumer_slot(self): return self._recorder_port.slot if self._recorder_port else None
+    @property
+    def producer_slot(self): return None
+
+class UDPListener(Thread):
+    def __init__(self, host, port, callback):
+        super().__init__(daemon=True)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.host = host
+        self.port = port
+        self.callback = callback
+        self.stopped = Event()
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def run(self):
+        try:
+            self.socket.bind((self.host, self.port))
+            self.ui.write(f"[*] UDP Listener: слушает порт {self.host}:{self.port}")
+        except Exception as e:
+            self.ui.write(f"[!] UDP Listener: ошибка биндинга порта: {e}")
+            return
+
+        while not self.stopped.is_set():
+            try:
+                data, _ = self.socket.recvfrom(4096)
+                if data and self.callback:
+                    self.callback(data)
+            except Exception:
+                break
+        self.socket.close()
+        self.ui.write("[*] UDP Listener: остановлен.")
+
+    def stop(self):
+        self.stopped.set()
+        try:
+            self.socket.sendto(b'', ('127.0.0.1', self.port))
+        except OSError:
+            pass
+
+class UDPFileAdapter:
+    """
+    Объект, который притворяется файлом для WaveRecorder,
+    но отправляет данные в UDP, пропуская WAV-заголовок.
+    """
+    def __init__(self, host, port):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.target_address = (host, port)
+        self.header_skipped = False
+        # Стандартный размер WAV заголовка - 44 байта.
+        # Мы пропустим чуть больше для надежности.
+        self.bytes_to_skip = 44
+        self.ui = UI() # Получаем экземпляр UI для логирования
+        self.ui.write(f"[*] UDP File Adapter: готов отправлять на {self.target_address}")
+
+    def write(self, data):
+        """WaveRecorder будет вызывать этот метод."""
+        if not self.header_skipped:
+            if len(data) < self.bytes_to_skip:
+                self.bytes_to_skip -= len(data)
+                return len(data) # "Записываем" и игнорируем
+            else:
+                # Отправляем данные после заголовка
+                payload = data[self.bytes_to_skip:]
+                self.header_skipped = True
+                self.bytes_to_skip = 0
+        else:
+            payload = data
+
+        if payload:
+            try:
+                self.socket.sendto(payload, self.target_address)
+            except Exception as e:
+                self.ui.write(f"[!] UDP File Adapter: ошибка отправки: {e}")
+        return len(data)
+
+    def close(self):
+        self.socket.close()
+        self.ui.write("[*] UDP File Adapter: закрыт.")
+
+    # Методы, которые может ожидать WaveRecorder
+    def flush(self): pass
+    def seekable(self): return False
+    def tell(self): return 0
+
+
+# This is a helper function for sending formatted notice messages
+def show_notice(text, bold=False): # bold is now ignored
+    ui = UI()
+    if isinstance(text, list):
+        # Now just write lines as plain strings
+        ui.writelines([str(line) for line in text])
+    else:
+        ui.write(str(text))
+
+
+# Utility classes
+#
+
+class BonjourNeighbour(object):
+    def __init__(self, neighbour, uri, display_name, host):
+        self.display_name = display_name
+        self.host = host
+        self.neighbour = neighbour
+        self.uri = uri
+
+
+class RTPStatisticsThread(Thread):
+    def __init__(self):
+        Thread.__init__(self)
+        self.setDaemon(True)
+        self.stopped = False
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def run(self):
+        application = SIPSessionApplication()
+        while not self.stopped:
+            if application.active_session is not None and application.active_session.streams:
+                audio_stream = next((stream for stream in application.active_session.streams if stream.type == 'audio'), None)
+                if audio_stream is not None:
+                    stats = audio_stream.statistics
+                    if stats is not None:
+                        # Use ui.write instead of reactor.callFromThread for TTY status
+                        self.ui.write('%s RTP statistics: RTT=%d ms, packet loss=%.1f%%, jitter RX/TX=%d/%d ms' %
+                                                                (datetime.now().replace(microsecond=0),
+                                                                stats['rtt']['avg'] / 1000,
+                                                                100.0 * stats['rx']['packets_lost'] / stats['rx']['packets'] if stats['rx']['packets'] else 0,
+                                                                stats['rx']['jitter']['avg'] / 1000,
+                                                                stats['tx']['jitter']['avg'] / 1000))
+            sleep(10)
+
+    def stop(self):
+        self.stopped = True
+
+
+class QueuedMessage(object):
+    def __init__(self, msg_id, content, content_type='text/plain', call_id=None):
+        self.id = msg_id
+        self.content = content
+        self.timestamp = None
+        self.content_type = content_type
+        self.encrypted = False
+        self.call_id = None
+
+
+class OTRInternalMessage(QueuedMessage):
+    def __init__(self, content):
+        super(OTRInternalMessage, self).__init__('OTR', content, 'text/plain')
+
+
+@implementer(IObserver)
+class MessageSession(object):
+
+    def __init__(self, account, target, route=None):
+        self.account = account
+        self.target = target
+        self.routes = None
+        self.msg_id = 0
+        self.started = False
+        self.msg_map = {}
+        self.route = None
+        self.ended = False
+        self.route = route
+        self.notification_center = NotificationCenter()
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+        self.encryption = OTREncryption(self)
+
+        self.message_queue = EventQueue(self._send_message)
+
+        target = self.target
+
+        if '@' not in target:
+            target = '%s@%s' % (target, self.account.id.domain)
+
+        if not target.startswith('sip:') and not target.startswith('sips:'):
+            target = 'sip:' + target
+
+        self.remote_uri = str(target).split(":")[1]
+
+        try:
+            self.target_uri = SIPURI.parse(target)
+        except SIPCoreError:
+            show_notice('Illegal SIP URI: %s' % target)
+            self.target_uri = None
+            return
+
+        self.notification_center = NotificationCenter()
+
+        if self.route:
+            show_notice('Message session started with %s via %s' % (self.target, self.route))
+        else:
+            show_notice('Message session started with %s' % self.target)
+
+    def end(self):
+        show_notice('Ending message session to %s' % self.target)
+        if self.encryption.active:
+            self.encryption.stop()
+
+        self.notification_center = None
+        self.message_queue = None
+        self.encryption = None
+        self.ended = True
+
+    def start(self):
+        if self.ended:
+            return
+
+        if self.route:
+            show_notice('%s Message session to %s will start via %s' % (datetime.now().replace(microsecond=0), self.remote_uri, self.routes[0]))
+
+            if not self.started:
+                self.message_queue.start()
+
+            if not self.encryption.active:
+                self.encryption.start()
+
+            self.started = True
+
+            return
+
+        lookup = DNSLookup()
+        self.notification_center.add_observer(self, sender=lookup)
+        settings = SIPSimpleSettings()
+
+        if isinstance(self.account, Account) and self.account.sip.outbound_proxy is not None:
+            uri = SIPURI(host=self.account.sip.outbound_proxy.host, port=self.account.sip.outbound_proxy.port, parameters={'transport': self.account.sip.outbound_proxy.transport})
+            tls_name = self.account.sip.tls_name or self.account.sip.outbound_proxy.host
+        elif isinstance(self.account, Account) and self.account.sip.always_use_my_proxy:
+            uri = SIPURI(host=self.account.id.domain)
+            tls_name = self.account.sip.tls_name or self.account.id.domain
+        else:
+            uri = self.remote_uri
+            tls_name = uri.host
+            if self.account is not BonjourAccount():
+                if self.account.id.domain == uri.host.decode():
+                    tls_name = self.account.sip.tls_name or self.account.id.domain
+                elif "isfocus" in str(uri) and uri.host.decode().endswith(self.account.id.domain):
+                    tls_name = self.account.conference.tls_name or self.account.sip.tls_name or self.account.id.domain
+            else:
+                is_ip_address = re.match("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", uri.host.decode()) or ":" in uri.host.decode()
+                if "isfocus" in str(uri) and self.account.conference.tls_name:
+                    tls_name = self.account.conference.tls_name
+                elif  is_ip_address and  self.account.sip.tls_name:
+                    tls_name = self.account.sip.tls_name
+
+        lookup.lookup_sip_proxy(uri, settings.sip.transport_list, tls_name=tls_name)
+
+    def handle_notification(self, notification):
+        if self.ended:
+            return
+
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+
+    def inject_otr_message(self, data):
+        if not self.encryption.active:
+            self.ui.write('Negotiating OTR encryption...') # Changed from ui.status
+        messageObject = OTRInternalMessage(data)
+        self.send_message(messageObject)
+
+    def _NH_DNSLookupDidSucceed(self, notification):
+        self.notification_center.remove_observer(self, sender=notification.sender)
+
+        self.routes = notification.data.result
+
+        show_notice('%s Message session to %s will start via %s' % (datetime.now().replace(microsecond=0), self.remote_uri, self.routes[0]))
+
+        if not self.started:
+            self.message_queue.start()
+
+        if not self.encryption.active and self.account.sms.enable_otr:
+            self.encryption.start()
+
+        self.started = True
+
+    def _NH_DNSLookupDidFail(self, notification):
+        self.notification_center.remove_observer(self, sender=notification.sender)
+        show_notice('%s Message session to %s failed: DNS lookup failed' % (datetime.now().replace(microsecond=0), self.remote_uri))
+        self.message_queue.stop()
+
+        if not self.routes:
+            self.start()
+
+        self.msg_id = self.msg_id + 1
+
+        if not isinstance(message, OTRInternalMessage):
+            messageObject = QueuedMessage(self.msg_id , message, content_type)
+            self.message_queue.put(messageObject)
+        else:
+            self.message_queue.put(message)
+
+        return self.msg_id
+
+    def send_message(self, message, content_type='text/plain'):
+        if not self.routes:
+            self.start()
+
+        self.msg_id = self.msg_id + 1
+
+        if not isinstance(message, OTRInternalMessage):
+            messageObject = QueuedMessage(self.msg_id , message, content_type)
+            self.message_queue.put(messageObject)
+        else:
+            self.message_queue.put(message)
+
+        return self.msg_id
+
+    @run_in_green_thread
+    def send_imdn_notification(self, imdn_id, imdn_timestamp, recipient, sender_identity, event):
+        show_notice('Send %s notification for %s' % (event, imdn_id))
+        if event == 'delivered':
+            notification = DeliveryNotification('delivered')
+        elif event == 'displayed':
+            notification = DisplayNotification(event)
+        else:
+            return
+
+        content = IMDNDocument.create(message_id=imdn_id, datetime=imdn_timestamp, recipient_uri=recipient, notification=notification)
+        self.send_message(content.decode(), content_type=IMDNDocument.content_type)
+
+    @run_in_green_thread
+    def _send_message(self, message):
+        if not self.routes:
+            return
+
+        if not self.route:
+            self.route = self.routes.pop(0)
+
+        identity = str(self.account.uri)
+
+        if self.account.display_name:
+            identity = '"%s" <%s>' % (self.account.display_name, identity)
+
+        if isinstance(message.content, str):
+            charset = 'utf8'
+            message.content = message.content.encode(charset)
+        else:
+            charset = None
+
+        what_type = None
+
+        if not isinstance(message, OTRInternalMessage):
+            if message.content_type not in (IsComposingDocument.content_type, IMDNDocument.content_type):
+                try:
+                    message.content = self.encryption.otr_session.handle_output(message.content, message.content_type)
+                except OTRError as e:
+                    if 'has ended the private conversation' in str(e):
+                        show_notice('Encryption has been disabled by remote party, please resend the message again')
+                        self.encryption.stop()
+                    else:
+                        show_notice('Failed to encrypt outgoing message: %s' % str(e))
+                    return
+                except OTRFinishedError:
+                    show_notice('Encryption has finished, please resend the message again')
+                    return
+
+                if self.encryption.active and not message.content.startswith(b'?OTR:'):
+                    show_notice('Encryption has been disabled by remote party, please resend the message again')
+                    self.encryption.stop()
+                    return None
+
+        else:
+            what_type = 'OTR'
+
+        if message.timestamp is None:
+            message.timestamp = ISOTimestamp.now()
+
+        additional_cpim_headers = []
+        additional_sip_headers = []
+
+        if self.account.sms.use_cpim:
+            if self.account.sms.enable_imdn and message.content_type != IsComposingDocument.content_type:
+                ns = CPIMNamespace('urn:ietf:params:imdn', 'imdn')
+                additional_cpim_headers = [CPIMHeader('Message-ID', ns, str(uuid.uuid4()))]
+
+                if message.content_type != IsComposingDocument.content_type:
+                    # request IMDN
+                    additional_cpim_headers.append(CPIMHeader('Disposition-Notification', ns, 'positive-delivery, display'))
+
+            content_type = 'message/cpim'
+            payload = CPIMPayload(message.content,
+                                  message.content_type,
+                                  charset='utf-8',
+                                  timestamp=message.timestamp,
+                                  sender=ChatIdentity(self.account.uri, self.account.display_name),
+                                  recipients=[ChatIdentity(self.remote_uri, None)],
+                                  additional_headers=additional_cpim_headers)
+        else:
+            payload = SimplePayload(message.content, message.content_type, charset)
+
+        content, content_type = payload.encode()
+
+        from_uri = self.account.uri
+        if self.account is BonjourAccount():
+            settings = SIPSimpleSettings()
+            from_uri.parameters['instance_id'] = settings.instance_id
+
+        message_request = Message(FromHeader(from_uri, self.account.display_name),
+                                  ToHeader(self.target_uri),
+                                  RouteHeader(self.route.uri),
+                                  content_type,
+                                  content,
+                                  credentials=self.account.credentials,
+                                  extra_headers=additional_sip_headers)
+
+        self.notification_center.add_observer(self, sender=message_request)
+
+        self.msg_map[str(message_request)] = message
+        message_request.send(15)
+        call_id = message_request._request.call_id.decode()
+        message.call_id = call_id
+        # ui = UI() # UI instance already available as self.ui
+
+        if message.id != 'OTR':
+            if '?OTR:' in content:
+                if message.content_type not in (IsComposingDocument.content_type, IMDNDocument.content_type):
+                    self.ui.write('Encrypted message sent to %s' % self.route.uri) # Changed from ui.status
+                message.encrypted = True
+            else:
+                if message.content_type not in (IsComposingDocument.content_type, IMDNDocument.content_type):
+                    self.ui.write('Message sent to %s' % (self.route.uri)) # Changed from ui.status
+
+        else:
+            self.ui.write('OTR message %s sent' % call_id) # Changed from ui.status
+
+
+    def handle_incoming_message(self, from_header, content_type, data, call_id):
+        self.msg_id = self.msg_id + 1
+
+        cpim_imdn_events = None
+        imdn_timestamp = None
+        imdn_id = None
+        from_header = FromHeader.new(from_header)
+        identity = '%s@%s' % (from_header.uri.user.decode(), from_header.uri.host.decode())
+
+        if content_type == 'message/cpim':
+            try:
+                cpim_message = CPIMPayload.decode(data)
+            except CPIMParserError as e:
+                show_notice('CPIM parse error: %s' % str(e))
+                return None
+            else:
+                content = cpim_message.content
+                payload = cpim_message
+                content_type = cpim_message.content_type
+
+                sender_identity = cpim_message.sender or from_header
+                imdn_timestamp = cpim_message.timestamp
+
+                for h in cpim_message.additional_headers:
+                    if h.name == "Message-ID":
+                        imdn_id = h.value
+                    if h.name == "Disposition-Notification":
+                        cpim_imdn_events = h.value
+
+                if content_type == IMDNDocument.content_type and content_type not in ('text/pgp-private-key', 'text/pgp-public-key'):
+                    document = IMDNDocument.parse(content)
+                    imdn_message_id = document.message_id.value
+                    imdn_status = document.notification.status.__str__()
+                    # ui = UI() # UI instance already available as self.ui
+                    msg = "Message %s was %s" % (imdn_message_id, imdn_status)
+                    self.ui.write(msg) # Changed from ui.status
+                    show_notice(msg)
+                    return
+        else:
+            payload = SimplePayload.decode(data, content_type)
+            from_header = FromHeader.new(from_header)
+            identity = '%s@%s' % (from_header.uri.user.decode(), from_header.uri.host.decode())
+            content = payload.content
+            content_type = payload.content_type
+
+        if cpim_imdn_events and imdn_timestamp and content_type not in ('text/pgp-private-key', 'text/pgp-public-key', 'application/sylk-file-transfer'):
+            if self.account.sms.enable_imdn:
+                if 'delivery' in cpim_imdn_events:
+                    self.send_imdn_notification(imdn_id, imdn_timestamp, identity, sender_identity, 'delivered')
+
+                if 'display' in cpim_imdn_events:
+                    self.send_imdn_notification(imdn_id, imdn_timestamp, identity, sender_identity, 'displayed')
+
+#        if content_type not in (IsComposingDocument.content_type, IMDNDocument.content_type):
+        if IgnoreMessage:
+            try:
+                content = self.encryption.otr_session.handle_input(content, content_type)
+            except IgnoreMessage:
+                show_notice('OTR message %s received' % call_id)
+                return None
+            except UnencryptedMessage:
+                encrypted = False
+                encryption_active = True
+            except EncryptedMessageError as e:
+                show_notice('OTP encrypted message error: %s' % str(e))
+                return None
+            except (OTRError, OTRFinishedError) as e:
+                show_notice('OTP error: %s' % str(e))
+                return None
+            else:
+                encrypted = encryption_active = self.encryption.active
+
+        if payload.charset is not None:
+            content = content.decode(payload.charset)
+        elif payload.content_type.startswith('text/'):
+            content.decode('utf8')
+
+        return (content_type, content, identity, self.msg_id, encrypted)
+
+    def _NH_SIPMessageDidSucceed(self, notification):
+        self.notification_center.remove_observer(self, sender=notification.sender)
+
+        try:
+            message = self.msg_map[str(notification.sender)]
+        except KeyError:
+            message = None
+        else:
+            del(self.msg_map[str(notification.sender)])
+
+        if not message:
+            return
+
+        if message.id in (None, 'OTR'):
+            return
+
+        if message.content_type in (IsComposingDocument.content_type, IMDNDocument.content_type):
+            return
+
+        # ui = UI() # UI instance already available as self.ui
+
+        if notification.data.code == 202:
+            self.ui.write('Message %s to %s will be delivered later by the server' % (message.id, self.remote_uri)) # Changed from ui.status
+        elif notification.data.code == 200:
+            self.ui.write('Message %s received by %s' % (message.id, self.remote_uri)) # Changed from ui.status
+        else:
+            self.ui.write('Message %s received by %s (code %d)' % (message.id, self.remote_uri, notification.data.code)) # Changed from ui.status
+
+    def _NH_SIPMessageDidFail(self, notification):
+        self.notification_center.remove_observer(self, sender=notification.sender)
+        try:
+            message = self.msg_map[str(notification.sender)]
+        except KeyError:
+            message = None
+        else:
+            del(self.msg_map[str(notification.sender)])
+
+        if not message:
+            return
+
+        if message.id in (None, 'OTR'):
+            return
+
+        if hasattr(notification.data, 'headers'):
+            server = notification.data.headers.get('Server', Null).body
+            client = notification.data.headers.get('Client', Null).body
+        else:
+            server = 'local'
+            client = 'local'
+
+        if notification.data.code == 408 and self.routes:
+            pass
+            # self.route = self.routes.pop(0)
+            # TO DO retry
+
+        if message.encrypted:
+            show_notice('%s Encrypted message %s to %s failed on %s: %s (%d)' % (datetime.now().replace(microsecond=0), message.id, self.remote_uri, server or client, notification.data.reason.decode(), notification.data.code))
+        else:
+            show_notice('%s Message %s to %s failed on %s: %s (%d)' % (datetime.now().replace(microsecond=0), message.id, self.remote_uri,  server or client, notification.data.reason.decode() if isinstance(notification.data.reason, bytes) else notification.data.reason, notification.data.code))
+
+
+try:
+    OTRTransport.register(MessageSession)
+except NameError:
+    pass
+
+@implementer(IObserver)
+class OutgoingCallInitializer(object):
+
+    def __init__(self, account, target, audio=False, chat=False, video=False, play_file=None, auto_reconnect=False):
+        self.account = account
+        self.target = target
+        self.auto_reconnect = auto_reconnect
+        self.streams = []
+        self.play_file = play_file
+        self.playback_wave_player = None
+        self.play_file = play_file
+        application = SIPSessionApplication()
+        self.playback_dir = application.playback_dir
+        self.remote_identity = None
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+        if video:
+            self.streams.append(MediaStreamRegistry.VideoStream())
+        if audio:
+            audio_stream = MediaStreamRegistry.AudioStream()
+            self.streams.append(audio_stream)
+            if self.play_file:
+                notification_center = NotificationCenter()
+                notification_center.add_observer(self, sender=audio_stream)
+        if chat:
+            self.streams.append(MediaStreamRegistry.ChatStream())
+        self.wave_ringtone = None
+
+    def start(self):
+        if self.play_file:
+            lock_file = "%s/playback.lock" % self.playback_dir
+            Path(lock_file).touch()
+            show_notice("Lock file %s created" % lock_file)
+
+        if isinstance(self.account, BonjourAccount) and '@' not in self.target:
+            show_notice('Bonjour mode requires a host in the destination address')
+            return
+        if '@' not in self.target:
+            self.target = '%s@%s' % (self.target, self.account.id.domain)
+        if not self.target.startswith('sip:') and not self.target.startswith('sips:'):
+            self.target = 'sip:' + self.target
+
+        try:
+            self.target = SIPURI.parse(self.target)
+        except SIPCoreError:
+            show_notice('Illegal SIP URI: %s' % self.target)
+        else:
+            if '.' not in self.target.host.decode() and not isinstance(self.account, BonjourAccount):
+                self.target.host = ('%s.%s' % (self.target.host.decode(), self.account.id.domain)).encode()
+            lookup = DNSLookup()
+            notification_center = NotificationCenter()
+            notification_center.add_observer(self, sender=lookup)
+            settings = SIPSimpleSettings()
+
+            if isinstance(self.account, Account) and self.account.sip.outbound_proxy is not None:
+                uri = SIPURI(host=self.account.sip.outbound_proxy.host, port=self.account.sip.outbound_proxy.port, parameters={'transport': self.account.sip.outbound_proxy.transport})
+                tls_name = self.account.sip.tls_name or self.account.sip.outbound_proxy.host
+            elif isinstance(self.account, Account) and self.account.sip.always_use_my_proxy:
+                uri = SIPURI(host=self.account.id.domain)
+                tls_name = self.account.sip.tls_name or self.account.id.domain
+            else:
+                uri = self.target
+                tls_name = uri.host
+                if self.account is not BonjourAccount():
+                    if self.account.id.domain == uri.host.decode():
+                        tls_name = self.account.sip.tls_name or self.account.id.domain
+                    elif "isfocus" in str(uri) and uri.host.decode().endswith(self.account.id.domain):
+                        tls_name = self.account.conference.tls_name or self.account.sip.tls_name or self.account.id.domain
+                else:
+                    is_ip_address = re.match("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", uri.host.decode()) or ":" in uri.host.decode()
+                    if "isfocus" in str(uri) and self.account.conference.tls_name:
+                        tls_name = self.account.conference.tls_name
+                    elif  is_ip_address and  self.account.sip.tls_name:
+                        tls_name = self.account.sip.tls_name
+
+            show_notice('DNS lookup for %s' % uri)
+            lookup.lookup_sip_proxy(uri, settings.sip.transport_list, tls_name=tls_name)
+
+    def reconnect(self, after=5):
+        if not self.auto_reconnect:
+           return
+
+        api.sleep(after)
+        notification_center = NotificationCenter()
+        notification_center.post_notification('SessionMustReconnect', data=NotificationData(target=str(self.target)))
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    def _NH_DNSLookupDidSucceed(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        session = Session(self.account)
+        notification_center.add_observer(self, sender=session)
+        session.connect(ToHeader(self.target), routes=notification.data.result, streams=self.streams)
+        application = SIPSessionApplication()
+        application.outgoing_session = session
+
+    def _NH_DNSLookupDidFail(self, notification):
+        show_notice('Call to %s failed: DNS lookup error: %s' % (self.target, notification.data.error))
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        self._playback_end(failed_reason='outgoing-failed-DNS')
+        self.reconnect(10)
+
+    def _NH_SIPSessionNewOutgoing(self, notification):
+        session = notification.sender
+        local_identity = str(session.local_identity.uri)
+        if session.local_identity.display_name:
+            local_identity = '"%s" <%s>' % (session.local_identity.display_name, local_identity)
+        remote_identity = str(session.remote_identity.uri)
+        self.remote_identity = remote_identity.split(":")[1]
+        if session.remote_identity.display_name:
+            remote_identity = '"%s" <%s>' % (session.remote_identity.display_name, remote_identity)
+        show_notice("Initiating SIP session from %s to %s via %s..." % (local_identity, remote_identity, session.route))
+        self.message_session_to = None
+
+    def _NH_SIPSessionGotRingIndication(self, notification):
+        settings = SIPSimpleSettings()
+        # ui = UI() # UI instance already available as self.ui
+        ringtone = settings.sounds.audio_outbound
+        if ringtone and self.wave_ringtone is None and not self.play_file:
+            self.wave_ringtone = WavePlayer(SIPApplication.voice_audio_mixer, ringtone.path.normalized, volume=ringtone.volume, loop_count=0, pause_time=2)
+            SIPApplication.voice_audio_bridge.add(self.wave_ringtone)
+            self.wave_ringtone.start()
+        self.ui.write('Ringing...') # Changed from ui.status
+
+    def _NH_SIPSessionWillStart(self, notification):
+        # ui = UI() # UI instance already available as self.ui
+        if self.wave_ringtone:
+            self.wave_ringtone.stop()
+            SIPApplication.voice_audio_bridge.remove(self.wave_ringtone)
+            self.wave_ringtone = None
+        self.ui.write('Connecting...') # Changed from ui.status
+
+    def _NH_SIPSessionDidEnd(self, notification):
+        self._playback_end()
+        session = notification.sender
+        show_notice('Session ended by %s' % notification.data.originator)
+        identity = str(session.remote_identity.uri)
+
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=session)
+
+        if session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+
+        if notification.data.originator == 'remote':
+            self.reconnect(5)
+
+    def _NH_SIPSessionDidStart(self, notification):
+        notification_center = NotificationCenter()
+        # ui = UI() # UI instance already available as self.ui
+        session = notification.sender
+        self.ui.write('Connected') # Changed from ui.status
+        # No need for reactor.callLater to clear status as it's just a log now
+
+        application = SIPSessionApplication()
+        application.on_call_started() # <-- Вызов метода для обновления глобального статуса
+
+        for stream in notification.data.streams:
+            if application.auto_record:
+                settings = SIPSimpleSettings()
+                if stream.type == 'audio':
+                    direction = session.direction
+                    remote = "%s@%s" % (session.remote_identity.uri.user, session.remote_identity.uri.host)
+                    filename = "%s-%s-%s.wav" % (datetime.now().strftime("%Y%m%d-%H%M%S"), remote, direction)
+                    path = os.path.join(settings.audio.directory.normalized, session.account.id, datetime.now().strftime("%Y%m%d"))
+                    makedirs(path)
+                    stream.start_recording(os.path.join(path, filename))
+
+            if stream.type in ('audio', 'video'):
+                show_notice('%s session established using %s codec at %sHz' % (stream.type.title(), stream.codec.capitalize(), stream.sample_rate))
+                if stream.ice_active:
+                    show_notice('%s RTP endpoints %s:%d (ICE type %s) <-> %s:%d (ICE type %s)' % (stream.type.title(),
+                                                                                                  stream.local_rtp_address,
+                                                                                                  stream.local_rtp_port,
+                                                                                                  stream.local_rtp_candidate.type.lower(),
+                                                                                                  stream.remote_rtp_address,
+                                                                                                  stream.remote_rtp_port,
+                                                                                                  stream.remote_rtp_candidate.type.lower()
+                                                                                                  )
+                                                                                                  )
+                else:
+                    show_notice('%s RTP endpoints %s:%d <-> %s:%d' % (stream.type.title(), stream.local_rtp_address, stream.local_rtp_port, stream.remote_rtp_address, stream.remote_rtp_port))
+
+        if session.remote_user_agent is not None:
+            show_notice('Remote SIP User Agent is "%s"' % session.remote_user_agent)
+
+    def _NH_MediaStreamDidStart(self, notification):
+        stream = notification.sender
+        if stream.type == 'audio' and self.play_file:
+            script = "%s/scripts/%s-playback-start" % (self.playback_dir, self.remote_identity)
+            if os.path.exists(script):
+                show_notice("Running script %s" % script)
+                p = subprocess.Popen(script)
+            else:
+                pass
+                #show_notice("Script does not exist %s" % script)
+
+            file = ResourcePath(self.play_file).normalized
+            show_notice("Playback file %s\n" % file)
+
+            self.playback_wave_player = WavePlayer(SIPApplication.voice_audio_mixer, file)
+            notification_center = NotificationCenter()
+            notification_center.add_observer(self, sender=self.playback_wave_player)
+            stream.bridge.add(self.playback_wave_player)
+            #SIPApplication.voice_audio_bridge.add(self.playback_wave_player)
+            self.playback_wave_player.start()
+
+    def _NH_WavePlayerDidEnd(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        show_notice("Playback finished")
+
+        if notification.sender == self.playback_wave_player:
+            application = SIPSessionApplication()
+            if application.outgoing_session:
+                application.outgoing_session.end()
+
+    def _NH_WavePlayerDidFail(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        show_notice('Playback %s failed: %s' % (notification.sender.filename, notification.data.error))
+        if notification.sender == self.playback_wave_player or self.play_file:
+
+            application = SIPSessionApplication()
+            if application.outgoing_session:
+                application.outgoing_session.end()
+
+            self._playback_end(failed_reason='outgoing-failed-playback')
+
+    def _NH_SIPSessionDidFail(self, notification):
+        code = notification.data.code
+        self._playback_end(failed_reason='outgoing-failed-' + str(code))
+
+        notification_center = NotificationCenter()
+        session = notification.sender
+        notification_center.remove_observer(self, sender=session)
+        for stream in session.streams or session.proposed_streams or []: # Ensure streams are discarded on fail too
+            notification_center.discard_observer(self, sender=stream)
+
+        # application instance is available, using it to manage global call state
+        application = SIPSessionApplication()
+        with application.state_lock:
+            if session in application.connected_sessions:
+                application.connected_sessions.remove(session)
+
+            if session is application.active_session:
+                if application.connected_sessions:
+                    # Session failed was the active one, but others are still connected
+                    application.active_session = application.connected_sessions[0] # Switch to first remaining
+                    application.message_session_to = None
+                    application.active_session.unhold()
+                    application.ignore_local_unhold = True
+                    # Global call_state['is_active'] remains True
+                else:
+                    # No more connected sessions. Global state becomes inactive.
+                    application.active_session = None
+                    if application.call_state['is_active']: # Only set if transitioning from active to inactive
+                        application.call_state['is_active'] = False
+                        # application.call_state['last_duration'] = duration_for_this_session # Duration of this specific failed session if needed
+                        application.ui.write("[*] Звонок завершен (из-за ошибки).")
+            # If the failed session was not the active_session, global state remains active if other sessions exist.
+
+        if self.playback_wave_player:
+            SIPApplication.voice_audio_bridge.remove(self.playback_wave_player)
+
+
+        if self.wave_ringtone:
+            self.wave_ringtone.stop()
+            SIPApplication.voice_audio_bridge.remove(self.wave_ringtone)
+            self.wave_ringtone = None
+        if notification.data.failure_reason == 'user request' and code == 487:
+            show_notice('SIP session cancelled')
+        elif notification.data.failure_reason == 'user request':
+            show_notice('SIP session rejected by user (%d %s)' % (code, notification.data.reason))
+        else:
+            pass # show_notice already handled above
+            #show_notice('SIP session failed: %s' % notification.data.failure_reason)
+
+        self.reconnect(15)
+
+    def _remove_lock(self):
+        # used by external audio recorder to know if we are in call
+        lock_file = "%s/playback.lock" % self.playback_dir
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+
+    def _playback_end(self, failed_reason=None):
+        reactor.callLater(0.1, self._remove_lock)
+
+        if not self.play_file:
+            return
+
+        settings = SIPSimpleSettings()
+        application = SIPSessionApplication()
+
+        if failed_reason or not application.auto_record:
+            save_path = os.path.join(settings.audio.directory.normalized, self.account.id, datetime.now().strftime("%Y%m%d"))
+            makedirs(save_path)
+            base = Path(self.play_file).stem
+            ext = Path(self.play_file).suffix
+            save_path = save_path + '/' + base + '-' + (failed_reason or 'outgoing') + ext
+            show_notice("Saved playback file to %s\n" % save_path)
+            os.rename(self.play_file, save_path)
+
+        if not failed_reason:
+            settings = SIPSimpleSettings()
+            api.sleep(0.2)
+            rogertone = settings.sounds.roger_beep
+            roger_tone = WavePlayer(SIPApplication.voice_audio_mixer, rogertone.path.normalized)
+            show_notice("Play roger beep")
+            SIPApplication.voice_audio_bridge.add(roger_tone)
+            roger_tone.start()
+        else:
+            api.sleep(0.2)
+            hangup_tone = WavePlayer(SIPApplication.voice_audio_mixer, ResourcePath('sounds/hangup_tone.wav').normalized)
+            SIPApplication.voice_audio_bridge.add(hangup_tone)
+            hangup_tone.start()
+
+        script = "%s/scripts/%s-playback-end" % (self.playback_dir, self.remote_identity)
+        if os.path.exists(script):
+            show_notice("Running script %s\n" % script)
+            p = subprocess.Popen(script)
+
+        if os.path.exists(self.play_file):
+            try:
+                os.remove(self.play_file)
+            except OSError:
+                pass
+
+        self.play_file = None
+
+@implementer(IObserver)
+class IncomingCallInitializer(object):
+
+    sessions = 0
+    tone_ringtone = None
+
+    def __init__(self, session, auto_answer_interval=None):
+        self.session = session
+        self.auto_answer_interval = auto_answer_interval
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def start(self):
+        IncomingCallInitializer.sessions += 1
+        notification_center = NotificationCenter()
+        notification_center.add_observer(self, sender=self.session)
+
+        # start auto-answer
+        self.answer_timer = None
+        if self.auto_answer_interval == 0:
+            self.session.accept(self.session.proposed_streams)
+            return
+        elif self.auto_answer_interval and self.auto_answer_interval > 0:
+            self.answer_timer = reactor.callFromThread(reactor.callLater, self.auto_answer_interval, self.session.accept, self.session.proposed_streams)
+
+        # start ringing
+        application = SIPSessionApplication()
+        self.wave_ringtone = None
+        if application.active_session is None:
+            if IncomingCallInitializer.sessions == 1:
+                ringtone = self.session.account.sounds.audio_inbound.sound_file if self.session.account.sounds.audio_inbound is not None else None
+                if ringtone:
+                    self.wave_ringtone = WavePlayer(SIPApplication.alert_audio_mixer, ringtone.path.normalized, volume=ringtone.volume, loop_count=0, pause_time=2)
+                    SIPApplication.alert_audio_bridge.add(self.wave_ringtone)
+                    self.wave_ringtone.start()
+        elif IncomingCallInitializer.tone_ringtone is None:
+            IncomingCallInitializer.tone_ringtone = WavePlayer(SIPApplication.voice_audio_mixer, ResourcePath('sounds/ring_tone.wav').normalized, loop_count=0, pause_time=6)
+            SIPApplication.voice_audio_bridge.add(IncomingCallInitializer.tone_ringtone)
+            IncomingCallInitializer.tone_ringtone.start()
+        self.session.send_ring_indication()
+
+        # No longer ask question directly, just log it.
+        identity = str(self.session.remote_identity.uri)
+        if self.session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (self.session.remote_identity.display_name, identity)
+        streams = '/'.join(stream.type for stream in self.session.proposed_streams)
+        if self.session.replaced_session:
+            self.session.accept(self.session.proposed_streams)
+            show_notice("SIP session was transfered to %s" % identity)
+        else:
+            self.ui.write("Incoming %s from %s. Use /accept_call or /reject_call to respond." % (streams, identity))
+            # If auto_answer_interval is None, it means manual answer is expected.
+            # In a non-TTY context, this means expecting a command via TCP/FIFO.
+            # No question object to add to UI.
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    # Removed _NH_UIQuestionGotAnswer completely. The UI is no longer asking interactive questions.
+    # New commands like /accept_call and /reject_call would need to be implemented in SIPSessionApplication.
+
+    def _NH_SIPSessionWillStart(self, notification):
+        # ui = UI() # UI instance already available as self.ui
+        # No question to remove, as it's not interactive
+        self.ui.write('Connecting...') # Changed from ui.status
+
+    def _NH_SIPSessionDidStart(self, notification):
+        notification_center = NotificationCenter()
+        session = notification.sender
+        notification_center.remove_observer(self, sender=session)
+        IncomingCallInitializer.sessions -= 1
+
+        # ui = UI() # UI instance already available as self.ui
+        self.ui.write('Connected') # Changed from ui.status
+        # No need for reactor.callLater to clear status as it's just a log now
+
+        application = SIPSessionApplication()
+        application.on_call_started() # <-- Вызов метода для обновления глобального статуса
+
+        identity = str(session.remote_identity.uri)
+        if session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+        show_notice("SIP session with %s established" % identity)
+
+        for stream in notification.data.streams:
+            if stream.type in ('audio', 'video'):
+                show_notice('%s stream using %s codec at %sHz' % (stream.type.title(), stream.codec.capitalize(), stream.sample_rate))
+
+                if stream.ice_active:
+                    show_notice('%s RTP endpoints %s:%d (ICE type %s) <-> %s:%d (ICE type %s)\n' % (stream.type.title(), stream.local_rtp_address,
+                                                                                                        stream.local_rtp_port,
+                                                                                                        stream.local_rtp_candidate.type.lower(),
+                                                                                                        stream.remote_rtp_address,
+                                                                                                        stream.remote_rtp_port,
+                                                                                                        stream.remote_rtp_candidate.type.lower()))
+                else:
+                    show_notice('%s RTP endpoints %s:%d <-> %s:%d\n' % (stream.type.title(),
+                                                                               stream.local_rtp_address,
+                                                                               stream.local_rtp_port,
+                                                                               stream.remote_rtp_address,
+                                                                               stream.remote_rtp_port))
+
+                if stream.encryption.active:
+                    show_notice('%s RTP stream is encrypted using %s (%s)\n' % (stream.type.title(), stream.encryption.type, stream.encryption.cipher))
+        if session.remote_user_agent is not None:
+            show_notice('Remote SIP User Agent is "%s"' % session.remote_user_agent)
+
+    def _NH_SIPSessionDidFail(self, notification):
+        notification_center = NotificationCenter()
+        # ui = UI() # UI instance already available as self.ui
+        session = notification.sender
+        notification_center.remove_observer(self, sender=session)
+
+        # No question to remove, as it's not interactive
+
+        IncomingCallInitializer.sessions -= 1
+        if self.wave_ringtone:
+            self.wave_ringtone.stop()
+            self.wave_ringtone = None
+        if IncomingCallInitializer.sessions == 0 and IncomingCallInitializer.tone_ringtone is not None:
+            IncomingCallInitializer.tone_ringtone.stop()
+            IncomingCallInitializer.tone_ringtone = None
+
+        # application instance is available, using it to manage global call state
+        application = SIPSessionApplication()
+        with application.state_lock:
+            if session in application.connected_sessions:
+                application.connected_sessions.remove(session)
+
+            if session is application.active_session:
+                if application.connected_sessions:
+                    # Session failed was the active one, but others are still connected
+                    application.active_session = application.connected_sessions[0] # Switch to first remaining
+                    application.message_session_to = None
+                    application.active_session.unhold()
+                    application.ignore_local_unhold = True
+                    # Global call_state['is_active'] remains True
+                else:
+                    # No more connected sessions. Global state becomes inactive.
+                    application.active_session = None
+                    if application.call_state['is_active']: # Only set if transitioning from active to inactive
+                        application.call_state['is_active'] = False
+                        # application.call_state['last_duration'] = duration_for_this_session # Duration of this specific failed session if needed
+                        application.ui.write("[*] Звонок завершен (из-за ошибки).")
+            # If the failed session was not the active_session, global state remains active if other sessions exist.
+
+        if notification.data.failure_reason == 'user request' and notification.data.code == 487:
+            show_notice('SIP session cancelled by user')
+        if notification.data.failure_reason == 'Call completed elsewhere' and notification.data.code == 487:
+            show_notice('SIP session cancelled, call was answered elsewhere')
+        elif notification.data.failure_reason == 'user request':
+            show_notice('SIP session rejected (%d %s)' % (notification.data.code, notification.data.reason))
+        else:
+            show_notice('SIP session failed: %s' % notification.data.failure_reason)
+
+
+@implementer(IObserver)
+class OutgoingProposalHandler(object):
+
+    def __init__(self, session, audio=False, chat=False):
+        self.session = session
+        self.stream = None
+        if audio:
+            self.stream = MediaStreamRegistry.AudioStream()
+        if chat:
+            self.stream = MediaStreamRegistry.ChatStream()
+        if not self.stream:
+            raise ValueError("Need to specify exactly one stream")
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def start(self):
+        notification_center = NotificationCenter()
+        notification_center.add_observer(self, sender=self.session)
+        try:
+            self.session.add_stream(self.stream)
+        except IllegalStateError:
+            notification_center.remove_observer(self, sender=self.session)
+            raise
+
+        remote_identity = str(self.session.remote_identity.uri)
+        if self.session.remote_identity.display_name:
+            remote_identity = '"%s" <%s>' % (self.session.remote_identity.display_name, remote_identity)
+        show_notice("Proposing %s to '%s'..." % (self.stream.type, remote_identity))
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    def _NH_SIPSessionProposalAccepted(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        application = SIPSessionApplication()
+        application.sessions_with_proposals.remove(notification.sender)
+        show_notice('Proposal accepted')
+
+    def _NH_SIPSessionProposalRejected(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+        application = SIPSessionApplication()
+        application.sessions_with_proposals.remove(notification.sender)
+
+        # ui = UI() # UI instance already available as self.ui
+        # self.ui.status = None # This is now just a log, no need to clear
+        if notification.data.code == 487:
+            show_notice('Proposal cancelled (%d %s)' % (notification.data.code, notification.data.reason))
+        else:
+            show_notice('Proposal rejected (%d %s)' % (notification.data.code, notification.data.reason))
+
+    def _NH_SIPSessionDidEnd(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.discard_observer(self, sender=self.session)
+
+
+@implementer(IObserver)
+class IncomingProposalHandler(object):
+
+    sessions = 0
+    tone_ringtone = None
+
+    def __init__(self, session):
+        self.session = session
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def start(self):
+        IncomingProposalHandler.sessions += 1
+        notification_center = NotificationCenter()
+        notification_center.add_observer(self, sender=self.session)
+
+        # start ringing
+        if IncomingProposalHandler.tone_ringtone is None:
+            IncomingProposalHandler.tone_ringtone = WavePlayer(SIPApplication.voice_audio_mixer, ResourcePath('sounds/ring_tone.wav').normalized, loop_count=0, pause_time=6)
+            SIPApplication.voice_audio_bridge.add(IncomingProposalHandler.tone_ringtone)
+            IncomingProposalHandler.tone_ringtone.start()
+        self.session.send_ring_indication()
+
+        # No longer ask question directly, just log it.
+        identity = str(self.session.remote_identity.uri)
+        if self.session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (self.session.remote_identity.display_name, identity)
+        streams = ', '.join(stream.type for stream in self.session.proposed_streams)
+        self.ui.write("'%s' wants to add %s. Use /accept_proposal or /reject_proposal to respond." % (identity, streams))
+        # No question object to add to UI.
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    # Removed _NH_UIQuestionGotAnswer completely. The UI is no longer asking interactive questions.
+    # New commands like /accept_proposal and /reject_proposal would need to be implemented in SIPSessionApplication.
+
+    def _NH_SIPSessionProposalAccepted(self, notification):
+        notification_center = NotificationCenter()
+        session = notification.sender
+        notification_center.remove_observer(self, sender=session)
+        application = SIPSessionApplication()
+        application.sessions_with_proposals.remove(notification.sender)
+        IncomingProposalHandler.sessions -= 1
+
+        # ui = UI() # UI instance already available as self.ui
+        # self.ui.status = None # This is now just a log, no need to clear
+        show_notice('Proposal accepted')
+
+    def _NH_SIPSessionProposalRejected(self, notification):
+        notification_center = NotificationCenter()
+        session = notification.sender
+        notification_center.remove_observer(self, sender=session)
+        application = SIPSessionApplication()
+        application.sessions_with_proposals.remove(notification.sender)
+        IncomingProposalHandler.sessions -= 1
+
+        # ui = UI() # UI instance already available as self.ui
+        # self.ui.status = None # This is now just a log, no need to clear
+        if notification.data.code == 487:
+            show_notice('Proposal cancelled (%d %s)' % (notification.data.code, notification.data.reason))
+        else:
+            show_notice('Proposal rejected (%d %s)' % (notification.data.code, notification.data.reason))
+
+        if IncomingProposalHandler.tone_ringtone:
+            IncomingProposalHandler.tone_ringtone.stop()
+            IncomingProposalHandler.tone_ringtone = None
+
+        # No question to remove, as it's not interactive
+
+    def _NH_SIPSessionHadProposalFailure(self, notification):
+        notification_center = NotificationCenter()
+        session = notification.sender
+        notification_center.remove_observer(self, sender=session)
+        IncomingProposalHandler.sessions -= 1
+
+        # ui = UI() # UI instance already available as self.ui
+        # self.ui.status = None # This is now just a log, no need to clear
+        show_notice('Proposal failed (%s)' % notification.data.failure_reason)
+
+    def _NH_SIPSessionDidEnd(self, notification):
+        notification_center = NotificationCenter()
+        # ui = UI() # UI instance already available as self.ui
+        session = notification.sender
+        notification_center.discard_observer(self, sender=session)
+
+        # self.ui.status = None # This is now just a log, no need to clear
+
+        # No question to remove, as it's not interactive
+
+        IncomingProposalHandler.sessions -= 1
+        if IncomingProposalHandler.sessions == 0 and IncomingProposalHandler.tone_ringtone is not None:
+            IncomingProposalHandler.tone_ringtone.stop()
+            IncomingProposalHandler.tone_ringtone = None
+
+
+@implementer(IObserver)
+class OutgoingTransferHandler(object):
+
+    def __init__(self, account, target, filepath):
+        self.account = account
+        self.target = target
+        self.filepath = filepath
+        self.file_selector = None
+        self.hash_compute_proc = None
+        self.session = None
+        self.stream = None
+        self.handler = None
+        self.wave_ringtone = None
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    @run_in_green_thread
+    def start(self):
+        if isinstance(self.account, BonjourAccount) and '@' not in self.target:
+            show_notice('Bonjour mode requires a host in the destination address')
+            return
+        if '@' not in self.target:
+            self.target = '%s@%s' % (self.target, self.account.id.domain)
+        if not self.target.startswith('sip:') and not self.target.startswith('sips:'):
+            self.target = 'sip:' + self.target
+        try:
+            self.target = SIPURI.parse(self.target)
+        except SIPCoreError:
+            show_notice('Illegal SIP URI: %s' % self.target)
+            return
+
+        show_notice('Preparing transfer...')
+        self.file_selector = FileSelector.for_file(self.filepath)
+        if '.' not in self.target.host.decode() and not isinstance(self.account, BonjourAccount):
+            self.target.host = ('%s.%s' % (self.target.host.decode(), self.account.id.domain)).encode()
+        lookup = DNSLookup()
+        notification_center = NotificationCenter()
+        notification_center.add_observer(self, sender=lookup)
+        settings = SIPSimpleSettings()
+
+        if isinstance(self.account, Account) and self.account.sip.outbound_proxy is not None:
+            uri = SIPURI(host=self.account.sip.outbound_proxy.host, port=self.account.sip.outbound_proxy.port, parameters={'transport': self.account.sip.outbound_proxy.transport})
+            tls_name = self.account.sip.tls_name or self.account.sip.outbound_proxy.host
+        elif isinstance(self.account, Account) and self.account.sip.always_use_my_proxy:
+            uri = SIPURI(host=self.account.id.domain)
+            tls_name = self.account.sip.tls_name or self.account.id.domain
+        else:
+            uri = self.target
+            tls_name = uri.host
+            if self.account is not BonjourAccount():
+                if self.account.id.domain == uri.host.decode():
+                    tls_name = self.account.sip.tls_name or self.account.id.domain
+                elif "isfocus" in str(uri) and uri.host.decode().endswith(self.account.id.domain):
+                    tls_name = self.account.conference.tls_name or self.account.sip.tls_name or self.account.id.domain
+            else:
+                is_ip_address = re.match("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", uri.host.decode()) or ":" in uri.host.decode()
+                if "isfocus" in str(uri) and self.account.conference.tls_name:
+                    tls_name = self.account.conference.tls_name
+                elif  is_ip_address and  self.account.sip.tls_name:
+                    tls_name = self.account.sip.tls_name
+
+        lookup.lookup_sip_proxy(uri, settings.sip.transport_list, tls_name=tls_name)
+
+    def _terminate(self, failure_reason=None):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=self.session)
+        notification_center.remove_observer(self, sender=self.stream)
+        notification_center.remove_observer(self, sender=self.handler)
+
+        # ui = UI() # UI instance already available as self.ui
+        # self.ui.status = None # This is now just a log, no need to clear
+
+        if self.wave_ringtone:
+            self.wave_ringtone.stop()
+            self.wave_ringtone = None
+
+        if failure_reason is None:
+            show_notice('File transfer of %s succeeded' % self.filepath)
+        else:
+            show_notice('File transfer of %s failed: %s' % (self.filepath, failure_reason))
+
+        self.session = None
+        self.stream = None
+        self.handler = None
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    def _NH_DNSLookupDidSucceed(self, notification):
+        notification.center.remove_observer(self, sender=notification.sender)
+        self.session = Session(self.account)
+        self.stream = MediaStreamRegistry.FileTransferStream(self.file_selector, 'sendonly')
+        self.handler = self.stream.handler
+        notification.center.add_observer(self, sender=self.session)
+        notification.center.add_observer(self, sender=self.stream)
+        notification.center.add_observer(self, sender=self.handler)
+        routes = notification.data.result
+        self.session.connect(ToHeader(self.target), routes=routes, streams=[self.stream])
+
+    def _NH_DNSLookupDidFail(self, notification):
+        notification.center.remove_observer(self, sender=notification.sender)
+        show_notice('File transfer to %s failed: DNS lookup error: %s' % (self.target, notification.data.error))
+
+    def _NH_SIPSessionNewOutgoing(self, notification):
+        session = notification.sender
+        local_identity = str(session.local_identity.uri)
+        if session.local_identity.display_name:
+            local_identity = '"%s" <%s>' % (session.local_identity.display_name, local_identity)
+        remote_identity = str(session.remote_identity.uri)
+        if session.remote_identity.display_name:
+            remote_identity = '"%s" <%s>' % (session.remote_identity.display_name, remote_identity)
+        show_notice("Initiating file transfer from '%s' to '%s' via %s..." % (local_identity, remote_identity, session.route))
+
+    def _NH_SIPSessionGotRingIndication(self, notification):
+        settings = SIPSimpleSettings()
+        # ui = UI() # UI instance already available as self.ui
+        ringtone = settings.sounds.audio_outbound
+        if ringtone and self.wave_ringtone is None:
+            self.wave_ringtone = WavePlayer(SIPApplication.voice_audio_mixer, ringtone.path.normalized, volume=ringtone.volume, loop_count=0, pause_time=2)
+            SIPApplication.voice_audio_bridge.add(self.wave_ringtone)
+            self.wave_ringtone.start()
+        self.ui.write('Ringing...') # Changed from ui.status
+
+    def _NH_SIPSessionWillStart(self, notification):
+        # ui = UI() # UI instance already available as self.ui
+        if self.wave_ringtone:
+            self.wave_ringtone.stop()
+        self.ui.write('Connecting...') # Changed from ui.status
+
+    def _NH_SIPSessionDidStart(self, notification):
+        session = notification.sender
+
+        # ui = UI() # UI instance already available as self.ui
+        self.ui.write('File transfer connected') # Changed from ui.status
+
+        application = SIPSessionApplication()
+        application.on_call_started() # <-- Вызов метода для обновления глобального статуса
+
+        identity = str(session.remote_identity.uri)
+        if session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+        show_notice("File transfer for %s to '%s' started" % (os.path.basename(self.filepath), identity))
+
+    def _NH_FileTransferHandlerHashProgress(self, notification):
+        progress = int(notification.data.processed*100/notification.data.total)
+        if progress % 10 == 0:
+            # ui = UI() # UI instance already available as self.ui
+            if progress < 100:
+                self.ui.write('Calculating checksum for %s: %s%%' % (self.filepath, progress)) # Changed from ui.status
+            else:
+                self.ui.write('Sending file transfer request...') # Changed from ui.status
+
+    def _NH_MediaStreamDidNotInitialize(self, notification):
+        self._terminate(failure_reason=notification.data.reason)
+
+    def _NH_FileTransferHandlerDidEnd(self, notification):
+        reactor.callFromThread(reactor.callLater, 0, self.session.end)
+        self._terminate(failure_reason=notification.data.reason)
+
+
+@implementer(IObserver)
+class IncomingTransferHandler(object):
+
+    sessions = 0
+    tone_ringtone = None
+
+    def __init__(self, session, auto_answer_interval=None):
+        self.session = session
+        self.stream = None
+        self.handler = None
+        self.auto_answer_interval = auto_answer_interval
+        self.file = None
+        self.filename = None
+        self.finished = False
+        self.hash = None
+        self.wave_ringtone = None
+        self.ui = UI() # Получаем экземпляр UI для логирования
+
+    def start(self):
+        self.stream = self.session.proposed_streams[0]
+        self.handler = self.stream.handler
+        self.file_selector = self.stream.file_selector
+        self.filename = self.file_selector.name
+
+        IncomingTransferHandler.sessions += 1
+        notification_center = NotificationCenter()
+        notification_center.add_observer(self, sender=self.session)
+        notification_center.add_observer(self, sender=self.stream)
+        notification_center.add_observer(self, sender=self.handler)
+
+        # start auto-answer
+        self.answer_timer = None
+        if self.auto_answer_interval == 0:
+            self.session.accept(self.session.proposed_streams)
+            return
+        elif (self.auto_answer_interval and self.auto_answer_interval > 0):
+            self.answer_timer = reactor.callFromThread(reactor.callLater, self.auto_answer_interval, self.session.accept, self.session.proposed_streams)
+
+        # start ringing
+        application = SIPSessionApplication()
+        if application.active_session is None:
+            if IncomingTransferHandler.sessions == 1:
+                ringtone = self.session.account.sounds.audio_inbound.sound_file if self.session.account.sounds.audio_inbound is not None else None
+                if ringtone:
+                    self.wave_ringtone = WavePlayer(SIPApplication.alert_audio_mixer, ringtone.path.normalized, volume=ringtone.volume, loop_count=0, pause_time=2)
+                    SIPApplication.alert_audio_bridge.add(self.wave_ringtone)
+                    self.wave_ringtone.start()
+        elif IncomingTransferHandler.tone_ringtone is None:
+            IncomingTransferHandler.tone_ringtone = WavePlayer(SIPApplication.voice_audio_mixer, ResourcePath('sounds/ring_tone.wav').normalized, loop_count=0, pause_time=6)
+            SIPApplication.voice_audio_bridge.add(IncomingTransferHandler.tone_ringtone)
+            IncomingTransferHandler.tone_ringtone.start()
+        self.session.send_ring_indication()
+
+        # No longer ask question directly, just log it.
+        identity = str(self.session.remote_identity.uri)
+        if self.session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (self.session.remote_identity.display_name, identity)
+        self.ui.write("Incoming file transfer for %s from '%s'. Use /accept_transfer or /reject_transfer to respond." % (os.path.basename(self.filename), identity))
+        # No question object to add to UI.
+
+    def _terminate(self, failure_reason=None):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=self.session)
+        notification_center.remove_observer(self, sender=self.stream)
+        notification_center.remove_observer(self, sender=self.handler)
+
+        # ui = UI() # UI instance already available as self.ui
+        # self.ui.status = None # This is now just a log, no need to clear
+
+        # No question to remove, as it's not interactive
+
+        if self.wave_ringtone:
+            self.wave_ringtone.stop()
+
+        if failure_reason is None:
+            show_notice('File saved to %s' % self.filename)
+        else:
+            show_notice('File transfer of %s failed: %s' % (self.filename, failure_reason))
+
+        self.session = None
+        self.stream = None
+        self.handler = None
+
+    def handle_notification(self, notification):
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    # Removed _NH_UIQuestionGotAnswer completely. The UI is no longer asking interactive questions.
+    # New commands like /accept_transfer and /reject_transfer would need to be implemented in SIPSessionApplication.
+
+    def _NH_SIPSessionWillStart(self, notification):
+        # ui = UI() # UI instance already available as self.ui
+        # No question to remove, as it's not interactive
+        self.ui.write('Connecting...') # Changed from ui.status
+
+        notification_center = NotificationCenter()
+        notification_center.add_observer(self, sender=notification.sender.proposed_streams[0])
+
+    def _NH_SIPSessionDidStart(self, notification):
+        session = notification.sender
+        IncomingCallInitializer.sessions -= 1
+
+        # ui = UI() # UI instance already available as self.ui
+        self.ui.write('File transfer connected') # Changed from ui.status
+
+        application = SIPSessionApplication()
+        application.on_call_started() # <-- Вызов метода для обновления глобального статуса
+
+        identity = str(session.remote_identity.uri)
+        if session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+        show_notice("File transfer for %s with %s started" % (os.path.basename(self.filename), identity))
+
+        if IncomingTransferHandler.sessions == 1:
+            if self.wave_ringtone:
+                self.wave_ringtone.stop()
+                self.wave_ringtone = None
+            if IncomingTransferHandler.tone_ringtone:
+                IncomingTransferHandler.tone_ringtone.stop()
+                IncomingTransferHandler.tone_ringtone = None
+
+    def _NH_SIPSessionDidFail(self, notification):
+        IncomingTransferHandler.sessions -= 1
+        if self.wave_ringtone:
+            self.wave_ringtone.stop()
+            self.wave_ringtone = None
+        if IncomingTransferHandler.sessions == 0 and IncomingTransferHandler.tone_ringtone is not None:
+            IncomingTransferHandler.tone_ringtone.stop()
+            IncomingTransferHandler.tone_ringtone = None
+
+        # application instance is available, using it to manage global call state
+        application = SIPSessionApplication()
+        with application.state_lock:
+            if session in application.connected_sessions:
+                application.connected_sessions.remove(session)
+
+            if session is application.active_session:
+                if application.connected_sessions:
+                    # Session failed was the active one, but others are still connected
+                    application.active_session = application.connected_sessions[0] # Switch to first remaining
+                    application.message_session_to = None
+                    application.active_session.unhold()
+                    application.ignore_local_unhold = True
+                    # Global call_state['is_active'] remains True
+                else:
+                    # No more connected sessions. Global state becomes inactive.
+                    application.active_session = None
+                    if application.call_state['is_active']: # Only set if transitioning from active to inactive
+                        application.call_state['is_active'] = False
+                        # application.call_state['last_duration'] = duration_for_this_session # Duration of this specific failed session if needed
+                        application.ui.write("[*] Звонок завершен (из-за ошибки).")
+            # If the failed session was not the active_session, global state remains active if other sessions exist.
+
+    def _NH_MediaStreamDidNotInitialize(self, notification):
+        self._terminate(failure_reason=notification.data.reason)
+
+    def _NH_FileTransferHandlerDidInitialize(self, notification):
+        self.filename = self.stream.file_selector.name
+
+    def _NH_FileTransferHandlerProgress(self, notification):
+        # ui = UI() # UI instance already available as self.ui
+        self.ui.write('%s: %s%%' % (os.path.basename(self.filename), notification.data.transferred_bytes*100//notification.data.total_bytes)) # Changed from ui.status
+
+    def _NH_FileTransferHandlerDidEnd(self, notification):
+        reactor.callFromThread(reactor.callLater, 0, self.session.end)
+        self._terminate(failure_reason=notification.data.reason)
+
+
+class UDPStreamRecorder(object):
+    """
+    Получает аудиоданные от моста (bridge) и отправляет их по UDP.
+    Это наш ВЫВОД звука.
+    """
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.stopped = False
+        self.ui = UI() # Получаем экземпляр UI для логирования
+        self.ui.write(f"[*] UDP Recorder: готов отправлять на {self.host}:{self.port}")
+
+    def put_frame(self, frame):
+        """
+        Этот метод будет вызываться аудио-мостом для каждого аудио-кадра.
+        Он реализует интерфейс "аудио-приемника" (sink).
+        """
+        if not self.stopped:
+            try:
+                # Отправляем кадр на указанный адрес
+                self.socket.sendto(frame.data, (self.host, self.port))
+            except Exception as e:
+                self.ui.write(f"[!] UDP Recorder: ошибка отправки: {e}") # Changed from print
+                self.stop()
+
+    def stop(self):
+        self.stopped = True
+        self.socket.close()
+        self.ui.write("[*] UDP Recorder: остановлен.") # Changed from print
+
+class SIPSessionApplication(SIPApplication):
+    # public methods
+    #
+
+    def __init__(self):
+        # Создаем экземпляр UI здесь, чтобы он был доступен во всем классе
+        self.ui = UI()
+
+        # Хранилище для состояния звонка
+        self.call_state = {
+            'is_active': False,
+            'start_time': None, # Время, когда самый первый звонок стал активным
+            'last_duration': timedelta(0) # Длительность последнего завершившегося звонка
+        }
+        self.state_lock = RLock() # Замок для потокобезопасного доступа к состоянию
+
+        self.file_player = None
+        self.account = None
+        self.options = None
+        self.target = None
+        self.filepath = None
+        self.enable_video = False
+        self.udp_player = None   # Ссылка на наш UDP-плеер
+        self.udp_recorder = None # Ссылка на наш UDP-рекордер
+        self.udp_input_port = None
+        self.udp_output_port = None
+        self.udp_listener = None
+        self.mic_is_forwarded = False
+
+        self.active_session = None # Текущая активная сессия (одна из connected_sessions)
+        self.message_session_to = None
+        self.outgoing_session = None
+        self.connected_sessions = [] # Все активные/удерживаемые сессии
+        self.sessions_with_proposals = set()
+        self.hangup_timers = {}
+        self.neighbours = {}
+        self.registration_succeeded = {}
+        self.stopped_event = Event()
+        self.received_message_ids = set()
+
+        self.message_sessions = set()
+        self.received_private_key = None
+        self.private_keys = {}
+        self.public_keys = {}
+
+        self.ip_address_monitor = IPAddressMonitor()
+        self.logger = None
+        self.rtp_statistics = None
+
+        self.hold_tone = None
+
+        self.ignore_local_hold = False
+        self.ignore_local_unhold = False
+
+        self.smp_verification_question = 'What is the ZRTP authentication string?'
+        self.smp_verifified_using_zrtp = False
+        self.smp_verification_delay = 0
+        self.smp_verification_tries = 5
+        self.smp_secret = None
+        self.must_exit = False
+        self.last_failure_reason = None
+        self.enable_playback = False
+        self.auto_record = False
+
+    def _CH_udpaudio(self, listen_port, send_host, send_port, responder=None):
+        if responder is None:
+            responder = self.ui.write
+
+        if self.active_session is None:
+            responder("Ошибка: Сначала установите звонок.")
+            return
+
+        audio_stream = next((s for s in self.active_session.streams if s.type == 'audio'), None)
+        if audio_stream is None:
+            responder("Ошибка: В текущем звонке нет аудиопотока.")
+            return
+
+        if self.udp_input_port or self.udp_output_port:
+            responder("Ошибка: UDP-режим уже активен.")
+            return
+
+        try:
+            listen_port = int(listen_port)
+            send_port = int(send_port)
+        except ValueError:
+            responder("Ошибка: Порты должны быть числами.")
+            return
+
+        responder(f"Запуск UDP аудио: слушаем {listen_port}, отправляем на {send_host}:{send_port}")
+
+        try:
+            # --- ВЫВОД ЗВУКА (Звонок -> UDP) с помощью WaveRecorder ---
+            # 1. Создаем наш псевдо-файл
+            udp_adapter = UDPFileAdapter(send_host, int(send_port))
+
+            # 2. Создаем стандартный WaveRecorder, который точно работает,
+            # и передаем ему наш адаптер вместо пути к файлу.
+            self.udp_recorder = WaveRecorder(self.voice_audio_mixer, udp_adapter)
+
+            # 3. Добавляем WaveRecorder в мост. ЭТО ДОЛЖНО РАБОТАТЬ.
+            self.voice_audio_bridge.add(self.udp_recorder)
+            self.udp_recorder.start()
+            responder("[*] Вывод звука в UDP запущен.")
+
+            # --- ВВОД ЗВУКА (UDP -> Звонок) ---
+            input_target_port = self.voice_audio_bridge.demultiplexer
+            if not input_target_port or not input_target_port.is_active:
+                raise Exception("Не удалось найти активный входной порт в аудио-мосте.")
+
+            self.udp_listener = UDPListener(
+                host='0.0.0.0',
+                port=int(listen_port),
+                callback=input_target_port.write_samples
+            )
+            self.udp_listener.start()
+
+            try:
+                self.voice_audio_bridge.remove(self.voice_audio_mixer)
+                self.mic_is_forwarded = True
+                responder("[*] Микрофон отключен от звонка.")
+            except Exception as e:
+                responder(f"[*] Предупреждение: не удалось отключить микрофон ({e}). Звук будет смешиваться.")
+                self.mic_is_forwarded = False
+
+            responder("[*] Ввод звука из UDP запущен.")
+            responder("[*] UDP-стриминг запущен.")
+
+        except Exception as e:
+            responder(f"[!] Не удалось запустить UDP-режим: {e}")
+            self._CH_stopudpaudio(responder=responder)
+
+    def _CH_stopudpaudio(self, responder=None):
+        if responder is None:
+            responder = self.ui.write
+
+        if not self.udp_listener and not self.udp_recorder:
+            responder("UDP-режим не был активен.")
+            return
+
+        responder("Остановка UDP-стриминга...")
+        try:
+            if self.udp_listener:
+                self.udp_listener.stop()
+                self.udp_listener = None
+
+            if self.udp_recorder:
+                self.voice_audio_bridge.remove(self.udp_recorder)
+                self.udp_recorder.stop()
+                self.udp_recorder = None
+
+            if self.mic_is_forwarded:
+                if not self.voice_audio_mixer in self.voice_audio_bridge:
+                    self.voice_audio_bridge.add(self.voice_audio_mixer)
+                self.mic_is_forwarded = False
+
+            responder("[*] UDP-стриминг остановлен.")
+        except Exception as e:
+            responder(f"[!] Ошибка при остановке UDP-режима: {e}")
+
+    def _CH_playaudio(self, filepath, responder=None):
+        if responder is None:
+            responder = self.ui.write
+
+        if self.active_session is None:
+            responder("Ошибка: Нет активного звонка для воспроизведения аудио.")
+            return
+
+        audio_stream = next((s for s in self.active_session.streams if s.type == 'audio'), None)
+        if audio_stream is None:
+            responder("Ошибка: В текущем звонке нет аудиопотока.")
+            return
+
+        if self.file_player is not None:
+            responder("Ошибка: Воспроизведение уже активно. Сначала остановите его командой /stopplayaudio.")
+            return
+
+        # Проверяем путь к файлу
+        filepath = os.path.expanduser(filepath)
+        if not os.path.exists(filepath):
+            responder(f"Ошибка: Файл не найден: {filepath}")
+            return
+
+        # Проверяем, что это WAV (pjsip обычно лучше работает с wav)
+        if not filepath.lower().endswith('.wav'):
+            responder("Предупреждение: Рекомендуется использовать WAV файлы для лучшей совместимости.")
+
+        try:
+            responder(f"Начинаю воспроизведение файла {os.path.basename(filepath)}...")
+
+            # 1. Отключаем микрофон от потока звонка
+            audio_stream.bridge.remove(SIPApplication.voice_audio_mixer)
+
+            # 2. Создаем и настраиваем плеер
+            self.file_player = WavePlayer(self.voice_audio_mixer, filepath, loop_count=1)
+            # 3. Подключаем плеер к аудиопотоку звонка
+            audio_stream.bridge.add(self.file_player)
+
+            # 4. Запускаем воспроизведение
+            self.file_player.start()
+
+            responder("Воспроизведение началось. Используйте /stopplayaudio для остановки.")
+
+        except Exception as e:
+            responder(f"Не удалось запустить воспроизведение: {e}")
+            # Возвращаем микрофон в случае ошибки
+            if not SIPApplication.voice_audio_mixer in audio_stream.bridge:
+                audio_stream.bridge.add(SIPApplication.voice_audio_mixer)
+
+
+    def _CH_stopplayaudio(self, responder=None):
+        if responder is None:
+            responder = self.ui.write
+
+        if self.file_player is None:
+            responder("Воспроизведение не было активно.")
+            return
+
+        if self.active_session is None:
+            responder("Нет активного звонка, но все равно останавливаю плеер.")
+
+        audio_stream = next((s for s in self.active_session.streams if s.type == 'audio'), None)
+
+        try:
+            responder("Останавливаю воспроизведение...")
+
+            # 1. Останавливаем и отключаем плеер
+            self.file_player.stop()
+            if audio_stream and self.file_player in audio_stream.bridge:
+                audio_stream.bridge.remove(self.file_player)
+
+            self.file_player = None # Сбрасываем ссылку
+
+            # 2. Возвращаем микрофон обратно в аудиопоток звонка
+            if audio_stream and not SIPApplication.voice_audio_mixer in audio_stream.bridge:
+                audio_stream.bridge.add(SIPApplication.voice_audio_mixer)
+
+            responder("Воспроизведение остановлено, микрофон снова активен.")
+
+        except Exception as e:
+            responder(f"Произошла ошибка при остановке: {e}")
+
+    def _CH_status(self, responder):
+        status_message = self.get_status_info()
+        responder(status_message)
+
+    def on_call_started(self):
+        """Этот метод вызывается, когда звонок становится активным."""
+        with self.state_lock:
+            if not self.call_state['is_active']: # Устанавливаем start_time только при переходе из неактивного состояния
+                self.call_state['is_active'] = True
+                self.call_state['start_time'] = datetime.now()
+                self.ui.write("[*] Звонок активен.")
+            # Если is_active уже True, start_time не меняем (отражает начало первого активного звонка)
+
+    # Метод on_call_ended удален, его логика перенесена в _NH_SIPSessionDidEnd и _NH_SIPSessionDidFail
+
+    def get_status_info(self):
+        """Собирает информацию о текущем состоянии и возвращает форматированную строку."""
+        with self.state_lock:
+            if self.call_state['is_active']:
+                current_duration = datetime.now() - self.call_state['start_time']
+                seconds = int(current_duration.total_seconds())
+                duration_str = f"{seconds // 3600:02}:{(seconds % 3600) // 60:02}:{seconds % 60:02}"
+                return "{"+f'"status":"active","time": "{duration_str}"'+"}"
+            else:
+                if self.call_state['start_time'] is None:
+                    return "{"+f'"status":"waiting","time": "00:00:00"'+"}"
+                else:
+                    seconds = int(self.call_state['last_duration'].total_seconds())
+                    duration_str = f"{seconds // 3600:02}:{(seconds % 3600) // 60:02}:{seconds % 60:02}"
+                    return "{"+f'"status":"waiting","time": "{duration_str}"'+"}"
+
+    def handle_notification(self, notification):
+        alive_file = os.path.join(config_directory, 'last_notification')
+        Path(alive_file).touch()
+
+        handler = getattr(self, '_NH_%s' % notification.name, Null)
+        handler(notification)
+
+    def start(self, target, options, filepath=None):
+        notification_center = NotificationCenter()
+
+        # ui = self.ui # UI instance already available as self.ui
+
+        history_file = os.path.join(config_directory, 'input.history')
+        self.keys_path = os.path.join(config_directory, 'keys')
+        makedirs(self.keys_path)
+
+        self.enable_playback = options.enable_playback
+        if options.playback_dir:
+            self.playback_dir = options.playback_dir
+        else:
+            self.playback_dir = "%s/spool/playback" % config_directory
+            makedirs(self.playback_dir)
+
+        lock_file = "%s/playback.lock" % self.playback_dir
+        if os.path.exists(lock_file):
+            os.remove(lock_file)
+
+        if self.enable_playback:
+            self.playback_queue = EventQueue(self._handle_outgoing_playback)
+
+            active_playback_dir = self.playback_dir + '/active'
+            makedirs(active_playback_dir)
+
+            scripts_playback_dir = self.playback_dir + '/scripts'
+            makedirs(scripts_playback_dir)
+
+        self.auto_record = options.auto_record
+
+        # Removed ui.input.add_history(history_file) as Input class is removed.
+
+        self.options = options
+        self.target = target
+        self.filepath = filepath
+        self.logger = Logger(sip_to_stdout=options.trace_sip,
+                             msrp_to_stdout=options.trace_msrp,
+                             pjsip_to_stdout=options.trace_pjsip,
+                             notifications_to_stdout=options.trace_notifications)
+
+        notification_center.add_observer(self, sender=self)
+        notification_center.add_observer(self, sender=self.ui) # Using self.ui directly
+        notification_center.add_observer(self, name='SIPSessionNewIncoming')
+        notification_center.add_observer(self, name='SIPSessionNewIncomingFromTransferFailed')
+        notification_center.add_observer(self, name='SIPSessionNewOutgoing')
+        notification_center.add_observer(self, name='RTPStreamDidChangeRTPParameters')
+        notification_center.add_observer(self, name='RTPStreamICENegotiationDidSucceed')
+        notification_center.add_observer(self, name='RTPStreamICENegotiationDidFail')
+        notification_center.add_observer(self, name='SIPEngineGotMessage')
+        notification_center.add_observer(self, name='SIPSessionDidEnd')
+        notification_center.add_observer(self, name='SIPSessionDidFail')
+        notification_center.add_observer(self, name='MediaStreamDidNotInitialize')
+        notification_center.add_observer(self, name='SIPSessionGotConferenceInfo')
+        notification_center.add_observer(self, name='SIPSessionTransferGotProgress')
+        notification_center.add_observer(self, name='SIPSessionTransferDidFail')
+        notification_center.add_observer(self, name='SIPSessionTransferNewIncoming')
+        notification_center.add_observer(self, name='RTPStreamICENegotiationStateDidChange')
+        notification_center.add_observer(self, name='RTPStreamICENegotiationDidFail')
+        notification_center.add_observer(self, name='RTPStreamICENegotiationDidSucceed')
+        notification_center.add_observer(self, name='ChatStreamOTREncryptionStateChanged')
+        notification_center.add_observer(self, name='TLSTransportHasChanged')
+        notification_center.add_observer(self, name='MediaStreamDidFail')
+        notification_center.add_observer(self, name='AudioDevicesDidChange')
+        notification_center.add_observer(self, name='DefaultAudioDeviceDidChange')
+        notification_center.add_observer(self, name='SessionMustReconnect')
+
+        log.level.current = log.level.WARNING # get rid of twisted messages
+        # Control bindings are for TTY. They are no longer relevant in this context.
+        # But keeping them for now as they are part of UI config, though UI does not act on them directly.
+        # The UI will parse commands from TCP and pass them to UIInputGotCommand.
+        control_bindings={} # Remove specific TTY control characters.
+
+        self.ui.start(prompt="sip> ",
+             control_bindings=control_bindings,
+             display_text=False, # Now always false for non-TTY
+             tcp_host='0.0.0.0',
+             tcp_port=9999)
+
+        Account.register_extension(AccountExtension)
+        BonjourAccount.register_extension(BonjourAccountExtension)
+        SIPSimpleSettings.register_extension(SIPSimpleSettingsExtension)
+
+        try:
+            SIPApplication.start(self, FileStorage(options.config_directory or config_directory))
+        except ConfigurationError as e:
+            show_notice("Failed to load sipclient's configuration: %s\n" % str(e), bold=False)
+            show_notice("If an old configuration file is in place, delete it or move it and recreate the configuration using the sip_settings script.", bold=False)
+            self.ui.stop()
+            self.stopped_event.set()
+        else:
+            show_notice("SDK version %s, core version %s, PJSIP version %s (%s)" % (version, CORE_REVISION, PJ_VERSION.decode(), PJ_SVN_REVISION))
+
+    # notification handlers
+    #
+
+    def _NH_SIPApplicationWillStart(self, notification):
+        account_manager = AccountManager()
+        notification_center = NotificationCenter()
+        settings = SIPSimpleSettings()
+        # ui = UI() # UI instance already available as self.ui
+
+        settings.logs.trace_sip = self.options.trace_sip or settings.logs.trace_sip
+        settings.logs.trace_msrp = self.options.trace_msrp or settings.logs.trace_msrp
+        settings.logs.trace_pjsip = self.options.trace_pjsip or settings.logs.trace_pjsip
+        settings.logs.trace_notifications = self.options.trace_notifications or settings.logs.trace_notifications
+
+        for account in account_manager.iter_accounts():
+            if isinstance(account, Account):
+                account.sip.register = False
+                account.presence.enabled = False
+                account.xcap.enabled = False
+                account.message_summary.enabled = False
+
+            notification_center.add_observer(self, sender=account)
+
+        if self.options.account is None:
+            self.account = account_manager.default_account
+        else:
+            possible_accounts = [account for account in account_manager.iter_accounts() if self.options.account in account.id and account.enabled]
+            if len(possible_accounts) > 1:
+                show_notice('More than one account exists which matches %s: %s' % (self.options.account, ', '.join(sorted(account.id for account in possible_accounts))), bold=False)
+                self.stop()
+                return
+            elif len(possible_accounts) == 0:
+                show_notice('No enabled account which matches %s was found. Available and enabled accounts: %s' % (self.options.account, ', '.join(sorted(account.id for account in account_manager.get_accounts() if account.enabled))), bold=False)
+                self.stop()
+                return
+            else:
+                self.account = possible_accounts[0]
+
+        if isinstance(self.account, Account):
+            self.account.sip.register = True
+
+        show_notice('Using account %s' % self.account.id, bold=False)
+        self.ui.write(f'Prompt: {self.account.id}') # Removed Prompt class, direct write to UI
+
+        self.logger.start()
+        if settings.logs.trace_sip and self.logger._siptrace_filename is not None:
+            show_notice('Logging SIP trace to file "%s"' % self.logger._siptrace_filename, bold=False)
+        if settings.logs.trace_msrp and self.logger._msrptrace_filename is not None:
+            show_notice('Logging MSRP trace to file "%s"' % self.logger._msrptrace_filename, bold=False)
+        if settings.logs.trace_pjsip and self.logger._pjsiptrace_filename is not None:
+            show_notice('Logging PJSIP trace to file "%s"' % self.logger._pjsiptrace_filename, bold=False)
+        if settings.logs.trace_notifications and self.logger._notifications_filename is not None:
+            show_notice('Logging notifications trace to file "%s"' % self.logger._notifications_filename, bold=False)
+
+        if self.options.disable_sound:
+            settings.audio.input_device = None
+            settings.audio.output_device = None
+            settings.audio.alert_device = None
+
+    def _NH_TLSTransportHasChanged(self, notification):
+        show_notice('TLS verify server: %s\n' % notification.data.verify_server)
+        show_notice('TLS certificate: %s\n' % notification.data.certificate)
+        if notification.data.certificate:
+            try:
+                contents = open(os.path.expanduser(notification.data.certificate), 'rb').read()
+                certificate = X509Certificate(contents) # validate the certificate
+            except (GNUTLSError, OSError) as e:
+                show_notice('Cannot read TLS certificate: %s\n' % str(e))
+                pass
+            else:
+                show_notice('TLS Subject: %s\n' % certificate.subject)
+
+    def _NH_MediaStreamDidFail(self, notification):
+        reason = notification.data.reason
+
+        if hasattr(notification.data, 'transport'):
+            reason = reason + " transport=%s" % notification.data.transport
+
+        if hasattr(notification.data, 'credentials'):
+            reason = reason + " verify_server=%s" % notification.data.credentials.verify_peer
+        show_notice('%s media stream failed: %s\n' % (notification.sender.type, reason))
+
+    def _NH_SIPApplicationDidStart(self, notification):
+        settings = SIPSimpleSettings()
+        engine = Engine()
+        show_notice('Available audio codecs: %s\n' % ', '.join([codec.decode() for codec in engine._ua.available_codecs]))
+        show_notice('Available video codecs: %s\n' % ', '.join([codec.decode() for codec in engine._ua.available_video_codecs]))
+
+        self.ip_address_monitor.start()
+
+        if self.enable_playback:
+            show_notice("Polling %s for wav files" % self.playback_dir)
+            self.playback_queue.start()
+            reactor.callLater(3, self.poll_playback_directory)
+
+        # set the file transfer directory if it's not set
+        if settings.file_transfer.directory is None:
+            settings.file_transfer.directory = 'file_transfers'
+
+        # display a list of available devices
+        self._CH_devices()
+
+        show_notice('Type /help to see a list of available commands.', bold=False)
+
+        if settings.tls.ca_list is None:
+            show_notice('Initializing default TLS certificates and settings')
+            copy_default_certificates()
+            settings.tls.ca_list = os.path.join(config_directory, 'tls/ca.crt')
+            settings.tls.certificate = os.path.join(config_directory, 'tls/default.crt')
+            settings.tls.verify_server = True
+            settings.save()
+
+        if self.target is not None:
+            if self.filepath:
+                self.send_outgoing_file(self.target, self.filepath)
+                self.must_exit = True
+            else:
+                call_initializer = OutgoingCallInitializer(self.account, self.target, audio=True, chat=True, video=True, auto_reconnect=self.options.auto_reconnect)
+                call_initializer.start()
+
+    def poll_playback_directory(self):
+        if self.outgoing_session:
+            reactor.callLater(1, self.poll_playback_directory)
+            return
+
+        files = list(filter(os.path.isfile, glob.glob(self.playback_dir + "/*.wav")))
+        files.sort(key=lambda x: os.path.getmtime(x))
+        for file in files:
+            if len(file.split('@')) == 2:
+                active_playback_dir = self.playback_dir + '/active'
+                basename = os.path.basename(file)
+                show_notice("Audio recording detected %s" % basename)
+                filename = '%s/%s-%s' % (active_playback_dir, datetime.now().strftime("%Y%m%d-%H%M%S"), basename)
+                os.replace(file, filename)
+                play_object = {'target': os.path.splitext(basename)[0],
+                               'filename': filename}
+                self.playback_queue.put(play_object)
+
+        reactor.callLater(1, self.poll_playback_directory)
+
+    def _handle_outgoing_playback(self, play_object):
+        self.play_file = play_object['filename']
+        call_initializer = OutgoingCallInitializer(self.account, play_object['target'], audio=True, play_file=self.play_file)
+        call_initializer.start()
+
+    def _NH_SIPApplicationWillEnd(self, notification):
+        show_notice('Application will end')
+        self.ip_address_monitor.stop()
+
+    def _NH_SIPApplicationDidEnd(self, notification):
+        self.ui.stop()
+        self.stopped_event.set()
+
+    def _NH_SIPEngineDetectedNATType(self, notification):
+        SIPApplication._NH_SIPEngineDetectedNATType(self, notification)
+        if notification.data.succeeded:
+            show_notice('Detected NAT type: %s' % notification.data.nat_type)
+
+    # _NH_UIInputGotCommand and _NH_UIInputGotText are crucial for command processing from TCP/FIFO.
+    # They should remain as they were, passing responder.
+    def _NH_UIInputGotCommand(self, notification):
+        handler = getattr(self, '_CH_%s' % notification.data.command, None)
+        responder = getattr(notification.data, 'responder', self.ui.write)
+
+        if handler is not None:
+            try:
+                # Call handler, passing args from data.args as positional, and responder as keyword.
+                handler(*notification.data.args, responder=responder)
+
+            except TypeError as e:
+                # If 'responder' is mentioned in the error, the handler didn't expect it.
+                # Try calling without it.
+                if 'responder' in str(e):
+                    try:
+                        handler(*notification.data.args)
+                    except TypeError:
+                        # Error even with old call
+                        responder(f"Error: Illegal arguments for command /{notification.data.command}.")
+                else:
+                    # Other TypeError (e.g., wrong number of arguments)
+                    print(f"[DEBUG] Command handler for '{notification.data.command}' failed: {e}")
+                    responder(f"Error: Illegal use of command /{notification.data.command}.")
+        else:
+            responder('Unknown command /%s. Type /help for a list of available commands.' % notification.data.command)
+
+    def _NH_RTPStreamICENegotiationStateDidChange(self, notification):
+        data = notification.data
+        stype = notification.sender.type.title()
+        if data.state == 'GATHERING':
+            show_notice("Gathering %s ICE Candidates..." % stype)
+        elif data.state == 'NEGOTIATION_START':
+            show_notice("Probing remote %s ICE candidates..." % stype)
+        elif data.state == 'NEGOTIATING':
+            show_notice("%s ICE negotiating in progress..." % stype)
+        elif data.state == 'GATHERING_COMPLETE':
+            show_notice("%s ICE candidates gathering complete" % stype)
+        elif data.state == 'RUNNING':
+            show_notice("%s ICE negotiation succeeded" % stype)
+        elif data.state == 'FAILED':
+            show_notice("%s ICE negotiation failed" % stype, True)
+
+    def _NH_RTPStreamICENegotiationDidFail(self, notification):
+        stream = notification.sender
+        show_notice('%s ICE negotiation failed: %s' % (notification.sender.type, notification.data.reason))
+
+    def _NH_RTPStreamICENegotiationDidSucceed(self, notification):
+        stream = notification.sender
+        show_notice('%s ICE negotiation succeeded' % stream.type)
+        show_notice('%s RTP endpoints: %s:%d (%s) <-> %s:%d (%s)' % (stream.type, stream.local_rtp_address,
+                                                                        stream.local_rtp_port,
+                                                                        stream.local_rtp_candidate.type.lower(),
+                                                                        stream.remote_rtp_address,
+                                                                        stream.remote_rtp_port,
+                                                                        stream.remote_rtp_candidate.type.lower()))
+
+        if stream.local_rtp_candidate.type.lower() != 'relay' and stream.remote_rtp_candidate.type.lower() != 'relay':
+            show_notice('%s stream is peer to peer' % stream.type)
+        else:
+            show_notice('%s stream is relayed by server' % stream.type)
+
+    def handle_private_keys(self, password, key):
+        account = key['account']
+        private_key_encrypted = key['private_key']
+        public_key = key['public_key']
+
+        try:
+            pgpMessage = pgpy.PGPMessage.from_blob(private_key_encrypted.encode())
+            decryptedKeyPair = pgpMessage.decrypt(password)
+            private_key = decryptedKeyPair.message
+
+            private_key_path = "%s/%s.privkey" % (self.keys_path, account.id)
+            fd = open(private_key_path, "wb+")
+            fd.write(private_key.encode())
+            fd.close()
+
+            show_notice("Private key saved to %s" % private_key_path)
+
+            public_key_path = "%s/%s.pubkey" % (self.keys_path, account.id)
+            fd = open(public_key_path, "wb+")
+            fd.write(public_key.encode())
+            fd.close()
+
+            show_notice("Public key saved to %s" % public_key_path)
+
+            account.sms.private_key = private_key_path
+            account.sms.public_key = public_key_path
+            account.sms.public_key_checksum = hashlib.sha1(public_key.encode()).hexdigest()
+            account.save()
+
+        except Exception as e:
+            show_notice("Import private key failed: %s" % str(e))
+
+    def get_public_key(self, uri):
+        public_key = None
+        try:
+            public_key = self.public_keys[uri]
+        except KeyError:
+            public_key_path = "%s/%s.pubkey" % (self.keys_path, uri)
+
+            if os.path.exists(public_key_path):
+                try:
+                    public_key, _ = pgpy.PGPKey.from_file(public_key_path)
+                except Exception as e:
+                    pass
+                else:
+                    self.public_keys[uri] = public_key
+                    show_notice('PGP public key imported from %s' % public_key_path)
+
+        return public_key
+
+    def _NH_UIInputGotText(self, notification):
+        msrp_chat = None
+        message_text = notification.data.text
+        local_identity = '%s@%s' % (self.account.id.username, self.account.id.domain)
+        # encrypted = False # Not used, can remove
+
+        if self.received_private_key:
+            show_notice('Handle private key')
+            self.handle_private_keys(message_text, self.received_private_key)
+            self.received_private_key = None
+            return
+
+        if self.active_session is not None:
+            msrp_chat = next((stream for stream in self.active_session.streams if stream.type == 'chat'), None)
+
+            if msrp_chat:
+                msrp_chat.send_message(message_text)
+
+                if msrp_chat.local_identity.display_name:
+                    local_identity = msrp_chat.local_identity.display_name
+                else:
+                    local_identity = str(msrp_chat.local_identity.uri)
+            else:
+                # compose SMS message
+                pass
+
+        elif self.message_session_to:
+            # compose SMS message
+            message_session = self.message_session(self.message_session_to)
+            msg_id = message_session.send_message(message_text)
+            message_text = message_text + ' (%s)' % msg_id
+
+            if message_session.encryption.active:
+                local_identity = '%s encrypted text sent to %s' % (local_identity, self.message_session_to)
+            else:
+                local_identity = '%s clear text sent to %s' % (local_identity, self.message_session_to)
+
+        else:
+            show_notice('No active chat or message session')
+            return
+
+        # ui = UI() # UI instance already available as self.ui
+        self.ui.write(f'{local_identity}> {message_text}') # Removed RichText
+
+    def message_session(self, recipient, account=None, route=None):
+        account = account or self.account
+        try:
+            message_session = next((session for session in self.message_sessions if session.target == recipient and account == session.account))
+        except StopIteration:
+            message_session = MessageSession(account, recipient, route)
+            self.message_sessions.add(message_session)
+
+        return message_session
+
+    def _NH_SIPSessionTransferNewIncoming(self, notification):
+        target = "%s@%s" % (notification.data.transfer_destination.user.decode(), notification.data.transfer_destination.host.decode())
+        show_notice('Session transfer requested by remote party to: %s' % target)
+        self.ui.write("Call transfer request to %s. Use /accept_transfer or /reject_transfer to respond." % target) # Log instead of question
+
+    # This handler now needs to be called by a command, e.g. /accept_transfer
+    def _CH_accept_transfer(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session:
+            responder('Accepting transfer...')
+            try:
+                self.active_session.accept_transfer()
+            except IllegalStateError:
+                responder('Error: Cannot accept transfer in current state.')
+        else:
+            responder('Error: No active session to transfer.')
+
+    # This handler now needs to be called by a command, e.g. /reject_transfer
+    def _CH_reject_transfer(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session:
+            responder('Rejecting transfer...')
+            try:
+                self.active_session.reject_transfer()
+            except IllegalStateError:
+                responder('Error: Cannot reject transfer in current state.')
+        else:
+            responder('Error: No active session to reject transfer for.')
+
+
+    def _NH_SIPEngineGotException(self, notification):
+        lines = ['An exception occured within the SIP core:']
+        lines.extend(notification.data.traceback.split('\n'))
+        show_notice(lines)
+
+    def _NH_SIPAccountRegistrationDidSucceed(self, notification):
+        account = notification.sender
+
+        try:
+            s = self.registration_succeeded[account.id]
+        except KeyError:
+            pass
+        else:
+            if s and notification.data.expires == 0:
+                show_notice('%s Registration ended for %s' % (datetime.now().replace(microsecond=0), notification.sender.id))
+                return
+
+        contact_header = notification.data.contact_header
+        contact_header_list = notification.data.contact_header_list
+        expires = notification.data.expires
+        registrar = notification.data.registrar
+        now = datetime.now().replace(microsecond=0)
+        if not self.connected_sessions:
+            lines = ['%s Registered contact "%s" of %s at %s:%d;transport=%s for %d seconds' % (now, contact_header.uri, account.id, registrar.address, registrar.port, registrar.transport, expires)]
+            if len(contact_header_list) > 1:
+                lines.append('%s Other registered contacts of %s:' % (now, account.id))
+                lines.extend('%s     %s of %s for %s seconds' % (now, str(other_contact_header.uri), account.id, other_contact_header.expires) for other_contact_header in contact_header_list if other_contact_header.uri != notification.data.contact_header.uri)
+
+            if account.contact.public_gruu is not None:
+                lines.append('%s     Public GRUU: %s' % (now, account.contact.public_gruu))
+
+            if account.contact.temporary_gruu is not None:
+                lines.append('%s  Temporary GRUU: %s' % (now, account.contact.temporary_gruu))
+
+            show_notice(lines)
+
+        self.registration_succeeded[account.id] = True
+
+    def _NH_SIPAccountRegistrationDidFail(self, notification):
+        account = notification.sender
+        if notification.data.error == self.last_failure_reason:
+            return
+
+        self.last_failure_reason = notification.data.error
+        if self.active_session is None:
+            show_notice('%s Failed to register contact for %s: %s (retrying in %.2f seconds)' % (datetime.now().replace(microsecond=0), account.id, notification.data.error, notification.data.retry_after))
+        self.registration_succeeded[notification.sender.id] = False
+
+    def _NH_SIPAccountRegistrationDidEnd(self, notification):
+        account = notification.sender
+        show_notice('%s Registration ended for %s' % (datetime.now().replace(microsecond=0), account.id))
+
+    def _NH_BonjourAccountRegistrationDidSucceed(self, notification):
+        show_notice('%s Registered Bonjour contact %s' % (datetime.now().replace(microsecond=0), notification.data.name))
+
+    def _NH_BonjourAccountRegistrationDidFail(self, notification):
+        if notification.data.reason == self.last_failure_reason:
+            return
+
+        self.last_failure_reason = notification.data.reason
+        #show_notice('%s Failed to register Bonjour contact: %s' % (datetime.now().replace(microsecond=0), notification.data.reason))
+
+    def _NH_BonjourAccountRegistrationDidEnd(self, notification):
+        pass
+        #show_notice('%s Bonjour registration ended for %s' % (datetime.now().replace(microsecond=0), notification.sender.id))
+
+    def _NH_BonjourAccountDidAddNeighbour(self, notification):
+        neighbour, record = notification.data.neighbour, notification.data.record
+        now = datetime.now().replace(microsecond=0)
+        #show_notice('%s Discovered Bonjour neighbour: "%s (%s)" <%s>' % (now, record.name, record.host, record.uri))
+        self.neighbours[neighbour] = BonjourNeighbour(neighbour, record.uri, record.name, record.host)
+
+    def _NH_BonjourAccountDidUpdateNeighbour(self, notification):
+        neighbour, record = notification.data.neighbour, notification.data.record
+        now = datetime.now().replace(microsecond=0)
+        try:
+            bonjour_neighbour = self.neighbours[neighbour]
+        except KeyError:
+            #show_notice('%s Discovered Bonjour neighbour: "%s (%s)" <%s>' % (now, record.name, record.host, record.uri))
+            self.neighbours[neighbour] = BonjourNeighbour(neighbour, record.uri, record.name, record.host)
+        else:
+            #show_notice('%s Updated Bonjour neighbour: "%s (%s)" <%s>' % (now, record.name, record.host, record.uri))
+            bonjour_neighbour.display_name = record.name
+            bonjour_neighbour.host = record.host
+            bonjour_neighbour.uri = record.uri
+
+    def _NH_BonjourAccountDidRemoveNeighbour(self, notification):
+        neighbour = notification.data.neighbour
+        now = datetime.now().replace(microsecond=0)
+        try:
+            bonjour_neighbour = self.neighbours.pop(neighbour)
+        except KeyError:
+            pass
+        else:
+            pass
+            #show_notice('%s Bonjour neighbour left: "%s (%s)" <%s>' % (now, bonjour_neighbour.display_name, bonjour_neighbour.host, bonjour_neighbour.uri))
+
+    def _NH_SIPEngineGotMessage(self, notification):
+        data = notification.data
+
+        call_id = data.headers.get('Call-ID', Null).body
+        try:
+            instance_id = data.from_header.uri.parameters.get('instance_id', None).split(":")[2]
+        except (IndexError, AttributeError):
+            instance_id = None
+
+        try:
+            self.received_message_ids.remove(call_id)
+        except KeyError:
+            self.received_message_ids.add(call_id)
+        else:
+            # drop duplicate message received
+            return
+
+        content_type = data.content_type
+
+        if content_type not in ('text/plain', 'text/html', 'message/cpim', IsComposingDocument.content_type, 'text/pgp-private-key', 'text/pgp-public-key'):
+            return
+
+        account = AccountManager().find_account(data.to_header.uri)
+
+        if not account:
+            return
+
+        is_composing = False
+        private_key = None
+
+        try:
+            private_key = self.private_keys[account.id]
+        except KeyError:
+            try:
+                private_key, _ = pgpy.PGPKey.from_file(account.sms.private_key)
+            except Exception as e:
+                pass
+            else:
+                show_notice('PGP private key imported from %s' % account.sms.private_key)
+                self.private_keys[account.id] = private_key
+
+        from_header = FromHeader.new(data.from_header)
+
+        identity = '%s@%s' % (from_header.uri.user.decode(), from_header.uri.host.decode())
+        remote_uri = identity
+        if isinstance(account, BonjourAccount):
+            via = data.headers.get('Via', Null)[0]
+            route = Route(address=via.host, port=via.port, transport=via.transport.lower())
+        else:
+            route = None
+
+        if data.headers.get('X-Replicated-Message', Null).body:
+           return
+
+        if content_type not in ('text/pgp-private-key', 'text/pgp-public-key'):
+            message_session = self.message_session(identity, account=account, route=route)
+            parsed_payload = message_session.handle_incoming_message(data.from_header, content_type, data.body, call_id)
+
+            if parsed_payload is None:
+                return
+
+            (content_type, content, identity, msg_id, encrypted) = parsed_payload
+            #if content_type not in ('text/pgp-private-key', 'text/pgp-public-key'):
+            #    self.message_session_to = None
+            #    message_session.end()
+            #    try:
+            #        self.message_sessions.remove(message_session)
+            #    except KeyError:
+            #        pass
+
+        else:
+            content = data.body
+            encrypted = False
+            message_session = None
+
+        if content_type not in ('text/pgp-private-key', 'text/pgp-public-key', IsComposingDocument.content_type):
+            self.message_session_to = identity
+
+        content_encoding = data.headers.get('Content-Encoding', Null).body
+        if content_encoding == 'deflate':
+            try:
+                content = zlib.decompress(content)
+            except zlib.error as e:
+                show_notice('Cannot decompress message: %s' % str(e))
+                return
+
+        if content_type == IsComposingDocument.content_type:
+            # body must not be utf-8 decoded
+            msg = IsComposingMessage.parse(content)
+            state = msg.state.value
+            refresh = msg.refresh.value if msg.refresh is not None else None
+            content_type = msg.content_type.value if msg.content_type is not None else None
+            last_active = msg.last_active.value if msg.last_active is not None else None
+            #show_notice('Is composing state=%s, refresh=%s, last_active=%s' % (state, refresh, last_active))
+
+            if state == 'active':
+                if refresh is None:
+                    refresh = 120
+
+                if last_active is not None and (last_active - ISOTimestamp.now() > timedelta(seconds=refresh)):
+                    # message is old, discard it
+                    return
+            elif state == 'idle':
+                return
+
+            is_composing = True
+
+        if from_header.display_name:
+            identity = '"%s" <%s>' % (from_header.display_name, identity)
+
+        content = content.decode() if isinstance(content, bytes) else content
+        content = content.strip()
+        #show_notice('Message type %s' % content_type)
+
+        if is_composing:
+            # ui = UI() # UI instance already available as self.ui
+            self.ui.write("%s is composing a message" % identity) # Changed from ui.status
+        else:
+            if encrypted:
+                show_notice("%s %s wrote: %s (%s encrypted)" % (datetime.now().replace(microsecond=0), identity, content, msg_id))
+            else:
+                if content_type == 'text/pgp-public-key':
+                    if content.startswith('-----BEGIN PGP PUBLIC KEY BLOCK-----') and content.endswith('-----END PGP PUBLIC KEY BLOCK-----'):
+                        public_key_path = "%s/%s.pubkey" % (self.keys_path, instance_id or remote_uri)
+                        fd = open(public_key_path, "wb+")
+                        fd.write(content.encode())
+                        fd.close()
+                        self.get_public_key(instance_id or remote_uri)
+                        show_notice("Public key saved to %s" % public_key_path)
+                        return
+
+                elif content_type == 'application/sylk-file-transfer':
+                    try:
+                        file_transfer = json.loads(content)
+                    except (TypeError, json.decoder.JSONDecodeError):
+                        pass
+                    else:
+                        try:
+                            show_notice("%s %s sent file %s to %s" % (datetime.now().replace(microsecond=0), file_transfer['sender']['uri'], file_transfer['filename'], file_transfer['receiver']['uri']))
+                        except KeyError as e:
+                            show_notice(file_transfer)
+                    return
+
+                elif content_type == 'text/pgp-private-key':
+                    public_key = ''
+                    private_key_encrypted = ''
+
+                    start_public = False
+                    start_private = False
+
+                    for l in content.split("\n"):
+                        if l == "-----BEGIN PGP PUBLIC KEY BLOCK-----":
+                            start_public = True
+
+                        if l == "-----BEGIN PGP MESSAGE-----":
+                            start_public = False
+                            start_private = True
+
+                        if start_public:
+                            public_key = public_key + l + "\n"
+
+                        if start_private:
+                            private_key_encrypted = private_key_encrypted + l + "\n"
+
+                    if private_key_encrypted and public_key:
+                        self.received_private_key = {'account': account, 'private_key': private_key_encrypted, 'public_key': public_key}
+                        # Now just log the request, expect a command like /accept_key
+                        self.ui.write("Private key received for account %s. Use /accept_key or /reject_key to respond." % (account.id))
+                else:
+                    if content.startswith('-----BEGIN PGP MESSAGE-----') and content.endswith('-----END PGP MESSAGE-----') and not private_key:
+                        show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, 'Received a PGP message for which we have no private key', msg_id))
+                    else:
+                        try:
+                            pgpMessage = pgpy.PGPMessage.from_blob(content.encode())
+                            decrypted_message = private_key.decrypt(pgpMessage)
+                        except (pgpy.errors.PGPDecryptionError, pgpy.errors.PGPError) as e:
+                            show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, 'PGP decrypt error', msg_id))
+                            return
+                        except ValueError as e:
+                            show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, content, msg_id))
+                        else:
+                            content = bytes(decrypted_message.message, 'latin1').decode()
+                            show_notice("%s %s wrote: %s (%s)" % (datetime.now().replace(microsecond=0), identity, content, msg_id))
+
+            if not encrypted and message_session and message_session.encryption and message_session.encryption.active and content_type != IsComposingDocument.content_type:
+                show_notice("%s %s stopped the encryption" % (datetime.now().replace(microsecond=0), identity))
+                message_session.encryption.stop()
+
+            if content.startswith('?OTR:') and message_session:
+                show_notice("%s %s encrypted message could not be read" % (datetime.now().replace(microsecond=0), identity))
+                message_session.encryption.stop()
+
+    def _NH_SIPSessionNewIncomingFromTransferFailed(self, notification):
+        session = notification.sender
+        show_notice('Incoming session with transfer from %s failed: %s' % (str(session.remote_identity.uri), notification.data))
+
+    def _NH_SIPSessionNewIncoming(self, notification):
+        session = notification.sender
+        transfer_streams = [stream for stream in session.proposed_streams if stream.type == 'file-transfer' and stream.direction == 'recvonly']
+        # only allow sessions with 0 or 1 file transfers
+        if transfer_streams:
+            if len(transfer_streams) > 1:
+                session.reject(488)
+                return
+            transfer_handler = IncomingTransferHandler(session, self.options.auto_answer_interval)
+            transfer_handler.start()
+        else:
+            for stream in notification.data.streams:
+                if stream.type in ('audio', 'chat'):
+                    break
+            else:
+                remote_identity = str(session.remote_identity.uri)
+                if session.remote_identity.display_name:
+                    remote_identity = '"%s" <%s>' % (session.remote_identity.display_name, remote_identity)
+
+                show_notice('Session from %s rejected due to incompatible media' % remote_identity)
+                session.reject(415)
+                return
+
+            notification_center = NotificationCenter()
+            notification_center.add_observer(self, sender=session)
+            call_initializer = IncomingCallInitializer(session, self.options.auto_answer_interval)
+            call_initializer.start()
+
+    def _NH_SIPSessionNewOutgoing(self, notification):
+        session = notification.sender
+        transfer_streams = [stream for stream in session.proposed_streams if stream.type == 'file-transfer']
+        if not transfer_streams:
+            notification_center = NotificationCenter()
+            notification_center.add_observer(self, sender=session)
+
+    def _NH_SIPSessionDidFail(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.discard_observer(self, sender=notification.sender)
+
+        if self.must_exit:
+            self.stop()
+
+    def _NH_SIPSessionWillStart(self, notification):
+        notification_center = NotificationCenter()
+        for stream in notification.sender.proposed_streams:
+            notification_center.add_observer(self, sender=stream)
+
+    def _NH_SIPSessionDidStart(self, notification):
+        session = notification.sender
+
+        self.on_call_started() # Обновляем глобальный статус активности
+
+        self.connected_sessions.append(session)
+        if self.active_session is not None:
+            self.active_session.hold()
+        self.active_session = session
+        self.message_session_to = None
+
+        # self._update_prompt() # Removed TTY-specific prompt update.
+        if len(self.connected_sessions) > 1:
+            # this displays the connected sessions
+            self._CH_sessions()
+
+        if self.options.auto_hangup_interval is not None:
+            if self.options.auto_hangup_interval == 0:
+                session.end()
+            else:
+                timer = reactor.callLater(self.options.auto_hangup_interval, session.end)
+                self.hangup_timers[id(session)] = timer
+
+    def _NH_SIPSessionWillEnd(self, notification):
+        notification_center = NotificationCenter()
+        session = notification.sender
+        if id(session) in self.hangup_timers:
+            timer = self.hangup_timers[id(session)]
+            if timer.active():
+                timer.cancel()
+            del self.hangup_timers[id(session)]
+
+    def _NH_SIPSessionDidEnd(self, notification):
+        notification_center = NotificationCenter()
+        session = notification.sender
+        notification_center.discard_observer(self, sender=session)
+        for stream in session.streams or session.proposed_streams or []:
+            notification_center.discard_observer(self, sender=stream)
+
+        identity = str(session.remote_identity.uri)
+        if session.remote_identity.display_name:
+            identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+        if notification.data.end_reason == 'user request':
+            show_notice('SIP session with %s ended by %s party' % (identity, notification.data.originator))
+        else:
+            show_notice('SIP session with %s ended due to error: %s' % (identity, notification.data.end_reason))
+
+        # Расчет длительности для конкретной завершившейся сессии
+        duration_for_this_session = timedelta(0)
+        if session.start_time:
+            duration_for_this_session = session.end_time - session.start_time
+            seconds = int(duration_for_this_session.total_seconds())
+            minutes, seconds = seconds // 60, seconds % 60
+            hours, minutes = minutes // 60, minutes % 60
+            hours += duration_for_this_session.days*24
+            if not minutes and not hours:
+                duration_text = '%d seconds' % seconds
+            elif not hours:
+                duration_text = '%02d:%02d' % (minutes, seconds)
+            else:
+                duration_text = '%02d:%02d:%02d' % (hours, minutes, seconds)
+        else:
+            duration_text = '0s'
+        show_notice('Session duration was %s' % duration_text)
+
+        # Обновление глобального статуса активности звонков
+        with self.state_lock:
+            if session in self.connected_sessions:
+                self.connected_sessions.remove(session)
+
+            if session is self.active_session:
+                if self.connected_sessions:
+                    # Если завершившаяся сессия была активной, но есть другие сессии,
+                    # делаем первую из оставшихся активной. Глобальный статус остаётся 'active'.
+                    self.active_session = self.connected_sessions[0]
+                    self.message_session_to = None
+                    self.active_session.unhold()
+                    self.ignore_local_unhold = True
+                    identity = str(self.active_session.remote_identity.uri)
+                    if self.active_session.remote_identity.display_name:
+                        identity = '"%s" <%s>' % (self.active_session.remote_identity.display_name, identity)
+                else:
+                    # Если завершившаяся сессия была последней активной,
+                    # переводим глобальный статус в неактивный.
+                    self.active_session = None
+                    if self.call_state['is_active']: # Убедимся, что переходим из активного состояния
+                        self.call_state['is_active'] = False
+                        self.call_state['last_duration'] = duration_for_this_session # Сохраняем длительность последнего звонка
+                        self.ui.write("[*] Звонок завершен.") # Логируем завершение глобального звонка
+            # Если завершившаяся сессия не была активной, но другие сессии есть,
+            # глобальный статус is_active остаётся True. Никаких действий.
+
+        on_hold_streams = [stream for stream in chain(*(session.streams for session in self.connected_sessions)) if stream.on_hold]
+        if not on_hold_streams and self.hold_tone is not None:
+            self.hold_tone.stop()
+            self.hold_tone = None
+
+        self._CH_sessions() # Обновляем список сессий (теперь он может быть пуст)
+
+        if self.must_exit:
+            self.stop()
+
+    def _NH_SIPSessionDidChangeHoldState(self, notification):
+        session = notification.sender
+        if notification.data.on_hold:
+            if notification.data.originator == 'remote':
+                if session is self.active_session:
+                    show_notice('Remote party has put the session on hold')
+                else:
+                    identity = str(session.remote_identity.uri)
+                    if session.remote_identity.display_name:
+                        identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+                    show_notice('%s has put the session on hold' % identity)
+            elif not self.ignore_local_hold:
+                if session is self.active_session:
+                    show_notice('Session was put on hold')
+                else:
+                    identity = str(session.remote_identity.uri)
+                    if session.remote_identity.display_name:
+                        identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+                    show_notice('Session with %s was put on hold' % identity)
+            else:
+                self.ignore_local_hold = False
+            if self.hold_tone is None:
+                self.hold_tone = WavePlayer(self.voice_audio_mixer, ResourcePath('sounds/hold_tone.wav').normalized, loop_count=0, pause_time=30, volume=50)
+                self.voice_audio_bridge.add(self.hold_tone)
+                self.hold_tone.start()
+        else:
+            if notification.data.originator == 'remote':
+                if session is self.active_session:
+                    show_notice('Remote party has taken the session out of hold')
+                else:
+                    identity = str(session.remote_identity.uri)
+                    if session.remote_identity.display_name:
+                        identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+                    show_notice('%s has taken the session out of hold' % identity)
+            elif not self.ignore_local_unhold:
+                if session is self.active_session:
+                    show_notice('Session was taken out of hold')
+                else:
+                    identity = str(session.remote_identity.uri)
+                    if session.remote_identity.display_name:
+                        identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+                    show_notice('Session with %s was taken out of hold' % identity)
+            else:
+                self.ignore_local_unhold = False
+            on_hold_streams = [stream for stream in chain(*(session.streams for session in self.connected_sessions)) if stream.on_hold]
+            if not on_hold_streams and self.hold_tone is not None:
+                self.hold_tone.stop()
+                self.hold_tone = None
+
+    def _NH_SIPSessionNewProposal(self, notification):
+        self.sessions_with_proposals.add(notification.sender)
+        if notification.data.originator == 'remote':
+            proposal_handler = IncomingProposalHandler(notification.sender)
+            proposal_handler.start()
+
+    def _NH_SIPSessionDidRenegotiateStreams(self, notification):
+        notification_center = NotificationCenter()
+        for stream in notification.data.added_streams:
+            notification_center.add_observer(self, sender=stream)
+
+        for stream in notification.data.removed_streams:
+            notification_center.remove_observer(self, sender=stream)
+
+        session = notification.sender
+        added_streams = ', '.join(stream.type for stream in notification.data.added_streams)
+        removed_streams = ', '.join(stream.type for stream in notification.data.removed_streams)
+        action = 'added' if added_streams else 'removed'
+        message = '%s party %s %s' % (notification.data.originator.capitalize(), action, added_streams or removed_streams)
+        if session is not self.active_session:
+            identity = str(session.remote_identity.uri)
+            if session.remote_identity.display_name:
+                identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+            message = '%s in session with %s' % (message, identity)
+        show_notice(message)
+        # self._update_prompt() # Removed TTY-specific prompt update.
+
+    def _NH_AudioStreamGotDTMF(self, notification):
+        notification_center = NotificationCenter()
+        digit = notification.data.digit
+        filename = 'sounds/dtmf_%s_tone.wav' % {'*': 'star', '#': 'pound'}.get(digit, digit)
+        wave_player = WavePlayer(self.voice_audio_mixer, ResourcePath(filename).normalized)
+        notification_center.add_observer(self, sender=wave_player)
+        self.voice_audio_bridge.add(wave_player)
+        wave_player.start()
+        show_notice('Got DMTF %s' % notification.data.digit)
+
+    def _NH_RTPStreamZRTPVerifiedStateChanged(self, notification):
+        # self._update_prompt() # Removed TTY-specific prompt update.
+        pass
+
+    def _NH_RTPStreamZRTPPeerNameChanged(self, notification):
+        # self._update_prompt() # Removed TTY-specific prompt update.
+        pass
+
+    def _NH_RTPStreamDidEnableEncryption(self, notification):
+        stream = notification.sender
+        show_notice("%s encryption activated using %s (%s)" % (stream.type.title(), stream.encryption.type, stream.encryption.cipher.decode() if isinstance(stream.encryption.cipher, bytes) else stream.encryption.cipher))
+
+        if stream.encryption.type == 'ZRTP' and stream.type == 'audio':
+            peer_name = stream.encryption.zrtp.peer_name if stream.encryption.zrtp.peer_name else None
+            sas = stream.encryption.zrtp.sas.decode() if isinstance(stream.encryption.zrtp.sas, bytes) else stream.encryption.zrtp.sas
+            show_notice("ZRTP secret is %s" % sas)
+            show_notice("ZRTP peer name is %s, use /zrtp_name command to change it" % (peer_name or 'not set'))
+            show_notice("ZRTP peer is %s, use /zrtp_verified command to toggle it" % ('verified' if stream.encryption.zrtp.verified else 'not verified'))
+
+        # self._update_prompt() # Removed TTY-specific prompt update.
+
+    def _NH_RTPStreamDidChangeRTPParameters(self, notification):
+        stream = notification.sender
+        show_notice('Audio RTP parameters changed:')
+        show_notice('Audio stream using %s codec at %sHz' % (stream.codec.capitalize(), stream.sample_rate))
+        show_notice('Audio RTP endpoints %s:%d <-> %s:%d' % (stream.local_rtp_address, stream.local_rtp_port, stream.remote_rtp_address, stream.remote_rtp_port))
+        if stream.encryption.active:
+            show_notice('RTP audio stream is encrypted using %s (%s)\n' % (stream.encryption.type, stream.encryption.cipher))
+
+    def _NH_AudioStreamDidStartRecordingAudio(self, notification):
+        show_notice('Recording audio to %s' % notification.data.filename)
+
+    def _NH_AudioStreamDidStopRecordingAudio(self, notification):
+        show_notice('Stopped recording audio to %s' % notification.data.filename)
+
+    def _NH_ChatStreamSMPVerificationDidStart(self, notification):
+        show_notice('OTR verification started', bold=False)
+        data = notification.data
+        session = self.active_session
+        stream = notification.sender
+        if data.originator == 'remote':
+            if data.question == self.smp_verification_question:
+                try:
+                    audio_stream = next(stream for stream in session.streams if stream.type=='audio' and stream.encryption.type=='ZRTP' and stream.encryption.active and stream.encryption.zrtp.verified)
+                except StopIteration:
+                    stream.encryption.smp_abort()
+                else:
+                    show_notice("OTR verification requested by remote and replied automatically using ZRTP SAS", bold=False)
+                    stream.encryption.smp_answer(audio_stream.encryption.zrtp.sas.encode())
+                    self.smp_verifified_using_zrtp = True
+            else:
+                show_notice("OTR verification requested by remote, reply using /otr_answer")
+                show_notice('Question: %s' % data.question.decode())
+                # self._update_prompt() # Removed TTY-specific prompt update.
+        else:
+            try:
+                audio_stream = next(stream for stream in session.streams if stream.type=='audio' and stream.encryption.type=='ZRTP' and stream.encryption.active and stream.encryption.zrtp.verified)
+            except StopIteration:
+                pass
+            else:
+                stream.encryption.smp_verify(audio_stream.encryption.zrtp.sas.encode(), question=self.smp_verification_question)
+                show_notice("OTR verification performed automatically using ZRTP SAS...", bold=False)
+                # self._update_prompt() # Removed TTY-specific prompt update.
+
+    def _NH_ChatStreamSMPVerificationDidNotStart(self, notification):
+        pass
+
+    def _NH_ChatStreamSMPVerificationDidEnd(self, notification):
+        data = notification.data
+        stream = notification.sender
+        if data.status is SMPStatus.Success:
+            show_notice("OTR verification %s" % ('succeeded' if data.same_secrets else 'failed: the secret is wrong'), bold=False)
+            stream.encryption.verified = data.same_secrets
+            # self._update_prompt() # Removed TTY-specific prompt update.
+        elif data.status is SMPStatus.Interrupted:
+            show_notice("OTR verification aborted: %s" % data.reason, bold=False)
+        elif data.status is SMPStatus.ProtocolError:
+            show_notice("OTR verification error: %s" % data.reason, bold=False)
+            if data.reason == 'startup collision':
+                self.smp_verification_tries -= 1
+                self.smp_verification_delay *= 2
+                if self.smp_verification_tries > 0:
+                    # TODO verify later
+                    pass
+
+    def _NH_ChatStreamOTRError(self, notification):
+        show_notice("Chat encryption error: %s", notification.data.error, bold=False)
+
+    def _NH_ChatStreamOTRVerifiedStateChanged(self, notification):
+        # self._update_prompt() # Removed TTY-specific prompt update.
+        pass
+
+    def _NH_ChatStreamOTREncryptionStateChanged(self, notification):
+        data = notification.data
+        stream = notification.sender
+        if data.new_state is OTRState.Encrypted:
+            local_fingerprint = stream.encryption.key_fingerprint
+            remote_fingerprint = stream.encryption.peer_fingerprint
+            show_notice("Chat encryption activated using OTR protocol", bold=False)
+            show_notice("OTR local fingerprint %s" % local_fingerprint, bold=False)
+            show_notice("OTR remote fingerprint %s" % remote_fingerprint, bold=False)
+
+            # ui = UI() # UI instance already available as self.ui
+            if stream.encryption.verified:
+                self.ui.write("OTR remote fingerprint has been verified") # Changed from ui.status
+            else:
+                self.ui.write("OTR remote fingerprint has not yet been verified") # Changed from ui.status
+
+        elif data.new_state is OTRState.Finished:
+            show_notice("Chat encryption deactivated", bold=False)
+        elif data.new_state is OTRState.Plaintext:
+            show_notice("Chat encryption deactivated", bold=False)
+
+        # self._update_prompt() # Removed TTY-specific prompt update.
+
+    def _NH_ChatStreamGotMessage(self, notification):
+        if not notification.data.message.content_type.startswith("text/"):
+            return
+        remote_identity = notification.data.message.sender.display_name or notification.data.message.sender.uri
+        doc = html.fromstring(notification.data.message.content)
+        if doc.body.text is not None:
+            doc.body.text = doc.body.text.lstrip('\n')
+        for br in doc.xpath('.//br'):
+            br.tail = '\n' + (br.tail or '')
+        head = f'{remote_identity}> ' # Simplified from RichText
+        # ui = UI() # UI instance already available as self.ui
+        self.ui.writelines([head + line for line in doc.body.text_content().splitlines()])
+
+    def _NH_DefaultAudioDeviceDidChange(self, notification):
+        SIPApplication._NH_DefaultAudioDeviceDidChange(self, notification)
+        if notification.data.changed_input and self.voice_audio_mixer.input_device=='system_default':
+            show_notice('Switched default input device to: %s' % self.voice_audio_mixer.real_input_device)
+        if notification.data.changed_output and self.voice_audio_mixer.output_device=='system_default':
+            show_notice('Switched default output device to: %s' % self.voice_audio_mixer.real_output_device)
+        if notification.data.changed_output and self.alert_audio_mixer.output_device=='system_default':
+            show_notice('Switched alert device to: %s' % self.alert_audio_mixer.real_output_device)
+
+    def _NH_AudioDevicesDidChange(self, notification):
+        old_devices = set(notification.data.old_devices)
+        new_devices = set(notification.data.new_devices)
+        added_devices = new_devices - old_devices
+        removed_devices = old_devices - new_devices
+        changed_input_device = self.voice_audio_mixer.real_input_device in removed_devices
+        changed_output_device = self.voice_audio_mixer.real_output_device in removed_devices
+        changed_alert_device = self.alert_audio_mixer.real_output_device in removed_devices
+
+        SIPApplication._NH_AudioDevicesDidChange(self, notification)
+
+        if added_devices:
+            show_notice('Added audio device(s): %s' % ', '.join(sorted(added_devices)))
+        if removed_devices:
+            show_notice('Removed audio device(s): %s' % ', '.join(sorted(removed_devices)))
+        if changed_input_device:
+            show_notice('Input device has been switched to: %s' % self.voice_audio_mixer.real_input_device)
+        if changed_output_device:
+            show_notice('Output device has been switched to: %s' % self.voice_audio_mixer.real_output_device)
+        if changed_alert_device:
+            show_notice('Alert device has been switched to: %s' % self.alert_audio_mixer.real_output_device)
+
+    def _NH_WavePlayerDidEnd(self, notification):
+        notification_center = NotificationCenter()
+        notification_center.remove_observer(self, sender=notification.sender)
+
+    def _NH_MediaStreamDidNotInitialize(self, notification):
+        if self.must_exit:
+            self.stop()
+
+    def _NH_SIPSessionTransferGotProgress(self, notification):
+        show_notice('Session transfer progress: %s (%s)' % (notification.data.reason, notification.data.code))
+
+    def _NH_SIPSessionTransferDidFail(self, notification):
+        show_notice('Session transfer failed: %s (%s)' % (notification.data.reason, notification.data.code))
+        # ui = UI() # UI instance already available as self.ui
+        # self.ui.status = None # This is now just a log, no need to clear
+
+    def _NH_SIPSessionGotConferenceInfo(self, notification):
+        info = notification.data.conference_info
+        show_notice('Conference users: %s' % ", ".join(user.entity.split(":")[1] for user in info.users))
+        if info.conference_description.resources:
+            for file in info.conference_description.resources.files:
+                show_notice('Conference shared file: %s (%s bytes)' % (file.name, file.size))
+
+    def _NH_RTPStreamICENegotiationDidSucceed(self, notification):
+        show_notice(" ")
+        show_notice("ICE negotiation succeeded in %s seconds" % notification.data.duration)
+        if self.rtp_statistics:
+            show_notice(" ")
+            show_notice("Local ICE candidates:")
+            for candidate in notification.data.local_candidates:
+                show_notice(str(candidate))
+            show_notice(" ")
+            show_notice("Remote ICE candidates:")
+            for candidate in notification.data.remote_candidates:
+                show_notice(str(candidate))
+            show_notice(" ")
+            show_notice("ICE connectivity valid pairs:")
+            for check in notification.data.valid_pairs:
+                show_notice(str(check))
+            show_notice(" ")
+
+    def _NH_RTPStreamICENegotiationDidFail(self, notification):
+        show_notice("\n")
+        show_notice("ICE negotiation failed: %s" % notification.data.reason.decode())
+
+    # command handlers
+    #
+
+    def _CH_call(self, target, video_option=None, responder=None):
+        if responder is None: responder = self.ui.write
+        if video_option and video_option != '+video':
+            raise TypeError()
+
+        if self.outgoing_session is not None:
+            responder('Please cancel any outgoing sessions before starting a new one')
+            return
+        call_initializer = OutgoingCallInitializer(self.account, target, audio=True, video=video_option=='+video')
+        call_initializer.start()
+
+    def _CH_audio(self, target, chat_option=None, responder=None):
+        if responder is None: responder = self.ui.write
+        if chat_option and chat_option != '+chat':
+            raise TypeError()
+        if self.outgoing_session is not None:
+            responder('Please cancel any outgoing sessions before starting a new one')
+            return
+        call_initializer = OutgoingCallInitializer(self.account, target, audio=True, chat=chat_option=='+chat')
+        call_initializer.start()
+
+    def _CH_m(self, target=None, responder=None):
+        self._CH_message(target, responder=responder)
+
+    def _CH_message(self, target=None, responder=None):
+        if responder is None: responder = self.ui.write
+        if not target:
+            responder('Usage: /message user@domain')
+            return # Added return to prevent further execution if no target
+
+        route = None
+
+        if isinstance(self.account, BonjourAccount):
+            try:
+                idx = int(target)
+                neighbour = list(self.neighbours.values())[idx-1]
+                responder('Using Bonjour neighbour "%s (%s)" <%s>' % (neighbour.display_name, neighbour.host, neighbour.uri))
+                target = '%s@%s' % (neighbour.uri.user, neighbour.uri.host)
+                route = Route(address=neighbour.uri.host, port=neighbour.uri.port, transport=neighbour.uri.transport)
+            except (IndexError, TypeError):
+                i = 1
+                lines = ['Bonjour neighbours:']
+                for key, neighbour in self.neighbours.items():
+                    lines.append(' "%s (%s)" <%s> (%i)' % (neighbour.display_name, neighbour.host, neighbour.uri, i))
+                    i = i + 1
+                responder(lines)
+                return # Added return to prevent further execution if Bonjour list is shown
+
+        try:
+            SIPURI.parse('sip:%s' % target)
+            if self.message_session_to != target:
+                message_session = self.message_session(target, route=route)
+            self.message_session_to = target
+        except SIPCoreError:
+            responder('Invalid SIP URI %s' % target)
+
+    def _CH_chat(self, target, audio_option=None, responder=None):
+        if responder is None: responder = self.ui.write
+        if audio_option and audio_option != '+audio':
+            raise TypeError()
+        if self.outgoing_session is not None:
+            responder('Please cancel any outgoing sessions before starting a new one')
+            return
+        call_initializer = OutgoingCallInitializer(self.account, target, audio=audio_option=='+audio', chat=True)
+        call_initializer.start()
+
+    def _NH_SessionMustReconnect(self, notification):
+        show_notice('Reconnecting session to %s\n' % notification.data.target)
+        self._CH_conf(notification.data.target)
+
+    def _CH_conf(self, target, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.outgoing_session is not None:
+            responder('Please cancel any outgoing sessions before starting a new one')
+            return
+        if '@' not in target:
+            server_address = self.account.conference.server_address
+            if not server_address:
+                if 'sip2sip' in self.account.id:
+                    server_address = 'conference.sip2sip.info'
+                elif 'sylk.link' in self.account.id:
+                    server_address = 'conference.sip2sip.info'
+
+                if server_address:
+                    target = '%s@%s' % (target, server_address)
+                else:
+                    responder('conference server_address is not defined')
+                    return
+
+        call_initializer = OutgoingCallInitializer(self.account, target, audio=True, chat=True, auto_reconnect=True)
+        call_initializer.start()
+
+    def send_outgoing_file(self, target, filepath, responder=None):
+        if responder is None: responder = self.ui.write
+        if '~' in filepath:
+            filepath = os.path.expanduser(filepath)
+        filepath = os.path.abspath(filepath)
+        if (os.path.exists(filepath)):
+            transfer_handler = OutgoingTransferHandler(self.account, target, filepath)
+            transfer_handler.start()
+        else:
+            responder('File %s does not exist' % filepath)
+
+
+    def _CH_send(self, target, filepath, responder=None):
+        if responder is None: responder = self.ui.write
+        self.send_outgoing_file(target, filepath, responder=responder)
+
+    def _CH_next(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if len(self.connected_sessions) > 1:
+            self.active_session.hold()
+            self.active_session = self.connected_sessions[(self.connected_sessions.index(self.active_session)+1) % len(self.connected_sessions)]
+            self.message_session_to = None
+            self.active_session.unhold()
+            self.ignore_local_unhold = True
+            identity = str(self.active_session.remote_identity.uri)
+            if self.active_session.remote_identity.display_name:
+                identity = '"%s" <%s>' % (self.active_session.remote_identity.display_name, identity)
+            responder('Active SIP session: "%s" (%d/%d)' % (identity, self.connected_sessions.index(self.active_session)+1, len(self.connected_sessions)))
+            # self._update_prompt() # Removed TTY-specific prompt update.
+
+    def _CH_prev(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if len(self.connected_sessions) > 1:
+            self.active_session.hold()
+            self.active_session = self.connected_sessions[self.connected_sessions.index(self.active_session)-1]
+            self.message_session_to = None
+            self.active_session.unhold()
+            self.ignore_local_unhold = True
+            identity = str(self.active_session.remote_identity.uri)
+            if self.active_session.remote_identity.display_name:
+                identity = '"%s" <%s>' % (self.active_session.remote_identity.display_name, identity)
+            responder('Active SIP session: "%s" (%d/%d)' % (identity, self.connected_sessions.index(self.active_session)+1, len(self.connected_sessions)))
+            # self._update_prompt() # Removed TTY-specific prompt update.
+
+    def _CH_sessions(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.connected_sessions:
+            lines = ['Connected sessions:']
+            for session in self.connected_sessions:
+                identity = str(session.remote_identity.uri)
+                if session.remote_identity.display_name:
+                    identity = '"%s" <%s>' % (session.remote_identity.display_name, identity)
+                lines.append('  SIP session with %s (%d/%d) - %s' % (identity, self.connected_sessions.index(session)+1, len(self.connected_sessions), 'active' if session is self.active_session else 'on hold'))
+            if len(self.connected_sessions) > 1:
+                lines.append('Use the /next and /prev commands to switch the active session')
+            responder(lines)
+        else:
+            responder('There are no connected sessions')
+
+    def _CH_n(self, responder=None):
+        self._CH_neighbours(responder=responder)
+
+    def _CH_neighbours(self, responder=None):
+        if responder is None: responder = self.ui.write
+        lines = ['Bonjour neighbours:']
+        for key, neighbour in self.neighbours.items():
+            lines.append(' "%s (%s)" <%s>' % (neighbour.display_name, neighbour.host, neighbour.uri))
+        responder(lines)
+
+    def _CH_trace(self, *types, responder=None):
+        if responder is None: responder = self.ui.write
+        if not types:
+            lines = []
+            lines.append('SIP tracing to console is now %s' % ('active' if self.logger.sip_to_stdout else 'inactive'))
+            lines.append('MSRP tracing to console is now %s' % ('active' if self.logger.msrp_to_stdout else 'inactive'))
+            lines.append('PJSIP tracing to console is now %s' % ('active' if self.logger.pjsip_to_stdout else 'inactive'))
+            lines.append('Notification tracing to console is now %s' % ('active' if self.logger.notifications_to_stdout else 'inactive'))
+            responder(lines)
+            return
+
+        add_types = [type[1:] for type in types if type[0] == '+']
+        remove_types = [type[1:] for type in types if type[0] == '-']
+        toggle_types = [type for type in types if type[0] not in ('+', '-')]
+
+        settings = SIPSimpleSettings()
+
+        if 'sip' in add_types or ('sip' in toggle_types and not self.logger.sip_to_stdout):
+            self.logger.sip_to_stdout = True
+            settings.logs.trace_sip = True
+            responder('SIP tracing to console is now activated')
+        elif 'sip' in remove_types or ('sip' in toggle_types and self.logger.sip_to_stdout):
+            self.logger.sip_to_stdout = False
+            settings.logs.trace_sip = False
+            responder('SIP tracing to console is now deactivated')
+
+        if 'msrp' in add_types or ('msrp' in toggle_types and not self.logger.msrp_to_stdout):
+            self.logger.msrp_to_stdout = True
+            settings.logs.trace_msrp = True
+            responder('MSRP tracing to console is now activated')
+        elif 'msrp' in remove_types or ('msrp' in toggle_types and self.logger.msrp_to_stdout):
+            self.logger.msrp_to_stdout = False
+            settings.logs.trace_msrp = False
+            responder('MSRP tracing to console is now deactivated')
+
+        if 'pjsip' in add_types or ('pjsip' in toggle_types and not self.logger.pjsip_to_stdout):
+            self.logger.pjsip_to_stdout = True
+            settings.logs.trace_pjsip = True
+            responder('PJSIP tracing to console is now activated')
+        elif 'pjsip' in remove_types or ('pjsip' in toggle_types and self.logger.pjsip_to_stdout):
+            self.logger.pjsip_to_stdout = False
+            settings.logs.trace_pjsip = False
+            responder('PJSIP tracing to console is now deactivated')
+
+        if 'notifications' in add_types or ('notifications' in toggle_types and not self.logger.notifications_to_stdout):
+            self.logger.notifications_to_stdout = True
+            settings.logs.trace_notifications = True
+            responder('Notification tracing to console is now activated')
+        elif 'notifications' in remove_types or ('notifications' in toggle_types and self.logger.notifications_to_stdout):
+            self.logger.notifications_to_stdout = False
+            settings.logs.trace_notifications = False
+            responder('Notification tracing to console is now deactivated')
+
+        settings.save()
+
+    def _CH_rtp(self, state='toggle', responder=None):
+        if responder is None: responder = self.ui.write
+        if state == 'toggle':
+            new_state = self.rtp_statistics is None
+        elif state == 'on':
+            new_state = True
+        elif state == 'off':
+            new_state = False
+        else:
+            raise TypeError()
+        if (self.rtp_statistics and new_state) or (not self.rtp_statistics and not new_state):
+            return
+        if new_state:
+            self.rtp_statistics = RTPStatisticsThread()
+            self.rtp_statistics.start()
+            responder('Output of RTP statistics and ICE negotiation results on console is now activated')
+        else:
+            self.rtp_statistics.stop()
+            self.rtp_statistics = None
+            responder('Output of RTP statistics and ICE negotiation results on console is now dectivated')
+
+    def _CH_mute(self, state='toggle', responder=None):
+        if responder is None: responder = self.ui.write
+        if state == 'toggle':
+            self.voice_audio_mixer.muted = not self.voice_audio_mixer.muted
+        elif state == 'on':
+            self.voice_audio_mixer.muted = True
+        elif state == 'off':
+            self.voice_audio_mixer.muted = False
+        responder('The microphone is now %s' % ('muted' if self.voice_audio_mixer.muted else 'unmuted'))
+
+    def _CH_camera(self, device=None, responder=None):
+        if responder is None: responder = self.ui.write
+        engine = Engine()
+        settings = SIPSimpleSettings()
+        video_devices = [None] + sorted(engine.video_devices)
+        if device is None:
+            if settings.video.device in video_devices:
+                old_device = settings.video.device
+            else:
+                old_device = None
+            new_device = video_devices[(video_devices.index(old_device)+1) % len(video_devices)]
+            settings.video.device = new_device
+            settings.save()
+            responder('Video device changed to %s' % new_device)
+        else:
+            device = device.decode(sys.getfilesystemencoding())
+            if device == 'None':
+                device = None
+            elif device not in video_devices:
+                responder('Unknown video device %s. Type /devices to see a list of available devices' % device)
+                return
+            try:
+                settings.video.device = new_device
+            except SIPCoreError as e:
+                responder('Failed to set video device to %s: %s' % (device, str(e)))
+            else:
+                responder('Video device changed to %s' % new_device)
+
+    def _CH_input(self, device=None, responder=None):
+        if responder is None: responder = self.ui.write
+        engine = Engine()
+        settings = SIPSimpleSettings()
+        input_devices = [None, 'system_default'] + sorted(engine.input_devices)
+        if device is None:
+            if self.voice_audio_mixer.input_device in input_devices:
+                old_input_device = self.voice_audio_mixer.input_device
+            else:
+                old_input_device = None
+            tail_length = settings.audio.echo_canceller.tail_length if settings.audio.echo_canceller.enabled else 0
+            new_input_device = input_devices[(input_devices.index(old_input_device)+1) % len(input_devices)]
+            try:
+                self.voice_audio_mixer.set_sound_devices(new_input_device, self.voice_audio_mixer.output_device, tail_length)
+            except SIPCoreError as e:
+                responder('Failed to set input device to %s: %s' % (new_input_device, str(e)))
+            else:
+                if new_input_device == 'system_default':
+                    responder('Input device changed to %s (system default device)' % self.voice_audio_mixer.real_input_device)
+                else:
+                    responder('Input device changed to %s' % new_input_device)
+
+                settings.audio.input_device = new_input_device
+                settings.save()
+
+        else:
+            device = device.decode(sys.getfilesystemencoding())
+            if device == 'None':
+                device = None
+            elif device not in input_devices:
+                responder('Unknown input device %s. Type /devices to see a list of available devices' % device)
+                return
+            tail_length = settings.audio.echo_canceller.tail_length if settings.audio.echo_canceller.enabled else 0
+            try:
+                self.voice_audio_mixer.set_sound_devices(device, self.voice_audio_mixer.output_device, self.voice_audio_mixer.tail_length)
+            except SIPCoreError as e:
+                responder('Failed to set input device to %s: %s' % (device, str(e)))
+            else:
+                if device == 'system_default':
+                    responder('Input device changed to %s (system default device)' % self.voice_audio_mixer.real_input_device)
+                else:
+                    responder('Input device changed to %s' % device)
+
+                settings.audio.input_device = new_input_device
+                settings.save()
+
+
+    def _CH_output(self, device=None, responder=None):
+        if responder is None: responder = self.ui.write
+        engine = Engine()
+        settings = SIPSimpleSettings()
+        output_devices = [None, 'system_default'] + sorted(engine.output_devices)
+
+        if device is None:
+            if self.voice_audio_mixer.output_device in output_devices:
+                old_output_device = self.voice_audio_mixer.output_device
+            else:
+                old_output_device = None
+            tail_length = settings.audio.echo_canceller.tail_length if settings.audio.echo_canceller.enabled else 0
+            # new_output_device = output_devices[(output_devices.index(old_output_device)+1) % len(output_devices)]
+            new_output_device='Loopback, Loopback PCM'
+            try:
+                self.voice_audio_mixer.set_sound_devices(self.voice_audio_mixer.input_device, new_output_device, tail_length)
+            except SIPCoreError as e:
+                responder('Failed to set output device to %s: %s' % (new_output_device, str(e)))
+            else:
+                if new_output_device == 'system_default':
+                    responder('Output device changed to %s (system default device)' % self.voice_audio_mixer.real_output_device)
+                else:
+                    responder('Output device changed to %s' % new_output_device)
+
+                settings.audio.output_device = new_output_device
+                settings.save()
+        else:
+            device = device.decode(sys.getfilesystemencoding())
+            if device == 'None':
+                device = None
+            elif device not in output_devices:
+                responder('Unknown output device %s. Type /devices to see a list of available devices' % device)
+                return
+            tail_length = settings.audio.echo_canceller.tail_length if settings.audio.echo_canceller.enabled else 0
+            try:
+                self.voice_audio_mixer.set_sound_devices(self.voice_audio_mixer.input_device, device, tail_length)
+            except SIPCoreError as e:
+                responder('Failed to set output device to %s: %s' % (device, str(e)))
+            else:
+                if device == 'system_default':
+                    responder('Output device changed to %s (system default device)' % self.voice_audio_mixer.real_output_device)
+                else:
+                    responder('Output device changed to %s' % device)
+                settings.audio.output_device = device
+                settings.save()
+
+    def _CH_alert(self, device=None, responder=None):
+        if responder is None: responder = self.ui.write
+        engine = Engine()
+        settings = SIPSimpleSettings()
+        output_devices = [None, 'system_default'] + sorted(engine.output_devices)
+        if device is None:
+            if self.alert_audio_mixer.output_device in output_devices:
+                old_output_device = self.alert_audio_mixer.output_device
+            else:
+                old_output_device = None
+            tail_length = settings.audio.echo_canceller.tail_length if settings.audio.echo_canceller.enabled else 0
+            new_output_device = output_devices[(output_devices.index(old_output_device)+1) % len(output_devices)]
+            try:
+                self.alert_audio_mixer.set_sound_devices(self.alert_audio_mixer.input_device, new_output_device, tail_length)
+            except SIPCoreError as e:
+                old_output_device = new_output_device
+                responder('Failed to set alert device to %s: %s' % (new_output_device, str(e)))
+            else:
+                if new_output_device == 'system_default':
+                    responder('Alert device changed to %s (system default device)' % self.alert_audio_mixer.real_output_device)
+                else:
+                    responder('Alert device changed to %s' % new_output_device)
+                settings.audio.alert_device = new_output_device
+                settings.save()
+        else:
+            device = device.decode(sys.getfilesystemencoding())
+            if device == 'None':
+                device = None
+            elif device not in output_devices:
+                responder('Unknown output device %s. Type /devices to see a list of available devices' % device)
+                return
+            tail_length = settings.audio.echo_canceller.tail_length if settings.audio.echo_canceller.enabled else 0
+            try:
+                self.alert_audio_mixer.set_sound_devices(self.alert_audio_mixer.input_device, device, tail_length)
+            except SIPCoreError as e:
+                responder('Failed to set alert device to %s: %s' % (device, str(e)))
+            else:
+                if device == 'system_default':
+                    responder('Alert device changed to %s (system default device)' % self.alert_audio_mixer.real_output_device)
+                else:
+                    responder('Alert device changed to %s' % device)
+                settings.audio.alert_device = device
+                settings.save()
+
+    def _CH_devices(self, responder=None):
+        if responder is None: responder = self.ui.write
+        engine = Engine()
+        settings = SIPSimpleSettings()
+        responder('Available audio input devices: %s' % ', '.join(['None', 'system_default'] + sorted(engine.input_devices)))
+        responder('Available audio output devices: %s' % ', '.join(['None', 'system_default'] + sorted(engine.output_devices)))
+        if self.voice_audio_mixer.input_device == 'system_default':
+            responder('Using audio input device: %s (system default device)' % self.voice_audio_mixer.real_input_device)
+        else:
+            responder('Using audio input device: %s' % self.voice_audio_mixer.input_device)
+
+        if self.voice_audio_mixer.output_device == 'system_default':
+            responder('Using audio output device: %s (system default device)' % self.voice_audio_mixer.real_output_device)
+        else:
+            responder('Using audio output device: %s' % self.voice_audio_mixer.output_device)
+
+        if self.alert_audio_mixer.output_device == 'system_default':
+            responder('Using audio alert device: %s (system default device)' % self.alert_audio_mixer.real_output_device)
+        else:
+            responder('Using audio alert device: %s' % self.alert_audio_mixer.output_device)
+
+        if engine.video_devices:
+            responder('Available cameras: %s' % ', '.join(sorted(engine.video_devices)))
+            responder('Selected camera: %s' % settings.video.device)
+
+        else:
+            if self.enable_video:
+                responder('No camera present, video is disabled')
+                self.enable_video = False
+
+    def _CH_help(self, responder=None):
+        self._print_help(responder=responder)
+
+    def _CH_quit(self, responder=None):
+        self.stop()
+
+    def _CH_eof(self, responder=None):
+        if responder is None: responder = self.ui.write
+        # ui = UI() # UI instance already available as self.ui
+        if self.active_session is not None:
+            if self.active_session in self.sessions_with_proposals:
+                responder('Cancelling proposal...')
+                try:
+                    self.active_session.cancel_proposal()
+                except IllegalStateError:
+                    self.outgoing_session.end()
+            else:
+                responder('Ending SIP session...')
+                self.active_session.end()
+        elif self.outgoing_session is not None:
+            responder('Cancelling SIP session...')
+            self.outgoing_session.end()
+        else:
+            self.stop()
+
+    def _CH_hangup(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is not None:
+            responder('Ending SIP session...')
+            self.active_session.end()
+        elif self.outgoing_session is not None:
+            responder('Cancelling SIP session...')
+            self.outgoing_session.end()
+        else:
+            try:
+                message_session = next((session for session in self.message_sessions if session.target == self.message_session_to and self.account == session.account))
+            except StopIteration:
+                pass
+            else:
+                message_session.end()
+                try:
+                    self.message_sessions.remove(message_session)
+                except KeyError:
+                    responder('Message session not found')
+                    pass
+
+    @run_in_green_thread
+    def _CH_dtmf(self, tones, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is not None:
+            audio_stream = next((stream for stream in self.active_session.streams if stream.type == 'audio'), None)
+            if audio_stream is not None:
+                notification_center = NotificationCenter()
+                for digit in tones:
+                    filename = 'sounds/dtmf_%s_tone.wav' % {'*': 'star', '#': 'pound'}.get(digit, digit)
+                    wave_player = WavePlayer(self.voice_audio_mixer, ResourcePath(filename).normalized)
+                    notification_center.add_observer(self, sender=wave_player)
+                    audio_stream.send_dtmf(digit)
+                    if self.active_session.account.rtp.inband_dtmf:
+                        audio_stream.bridge.add(wave_player)
+                    self.voice_audio_bridge.add(wave_player)
+                    wave_player.start()
+                    api.sleep(0.3)
+
+    def _CH_record(self, state='toggle', responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            return
+        audio_stream = next((stream for stream in self.active_session.streams if stream.type == 'audio'), None)
+        if audio_stream is not None:
+            if state == 'toggle':
+                new_state = audio_stream.recorder is None
+            elif state == 'on':
+                new_state = True
+            elif state == 'off':
+                new_state = False
+            else:
+                responder('Illegal argument to /record. Type /help for a list of available commands.')
+                return
+            if new_state:
+                settings = SIPSimpleSettings()
+                direction = self.active_session.direction
+                remote = "%s@%s" % (self.active_session.remote_identity.uri.user, self.active_session.remote_identity.uri.host)
+                filename = "%s-%s-%s.wav" % (datetime.now().strftime("%Y%m%d-%H%M%S"), remote, direction)
+                path = os.path.join(settings.audio.directory.normalized, self.active_session.account.id, datetime.now().strftime("%Y%m%d"))
+                try:
+                    audio_stream.start_recording(os.path.join(path, filename))
+                except RuntimeError as e:
+                    responder(str(e))
+            else:
+                try:
+                    audio_stream.stop_recording()
+                except RuntimeError as e:
+                    responder(str(e))
+
+    def _CH_account(self, *args, responder=None):
+        if responder is None: responder = self.ui.write
+        account_manager = AccountManager()
+
+        if not args or args[0] == 'list':
+            responder('Accounts available: %s' % ", ".join(account.id for account in account_manager.iter_accounts() if account != self.account and account.enabled))
+
+        elif args and args[0] == 'register':
+            if not self.account.sip.register:
+                self.registration_succeeded[self.account.id] = False
+
+            self.account.sip.register = not self.account.sip.register
+            self.account.save()
+
+        elif args and args[0] == 'enroll':
+            settings = SIPSimpleSettings()
+            try:
+                username = args[1].strip()
+                password = args[2].strip()
+                email = args[3].strip()
+                display_name = " ".join(args[4:])
+
+                if not "@" in email:
+                    responder('Email address is not valid, must be user@domain')
+                    return
+
+                if not display_name:
+                    responder('Please specify a display name')
+                    return
+
+                sip_address = '%s@%s' % (username, settings.enrollment.default_domain)
+                if account_manager.has_account(sip_address):
+                    responder('Account %s is already defined' % sip_address)
+                    return
+            except IndexError:
+                responder('To enroll an account you must provide: username password email display_name')
+                return
+            else:
+                data = self.enroll(username, password, email, display_name)
+
+                if data['error']:
+                    responder(data['error'])
+                else:
+                    responder('Account %s created' % data['sip_address'])
+
+        elif args:
+            new_account = args[0]
+            possible_accounts = [account for account in account_manager.iter_accounts() if new_account in account.id and account.enabled]
+            if len(possible_accounts) > 1:
+                responder('More than one account exists which matches %s: %s' % (new_account, ', '.join(sorted(account.id for account in possible_accounts))))
+            elif len(possible_accounts) == 0:
+                responder('No enabled account which matches %s was found. Available and enabled accounts: %s' % (self.options.account, ', '.join(sorted(account.id for account in possible_accounts))))
+            elif possible_accounts[0] == self.account:
+                responder('Same account selected')
+            elif possible_accounts[0] != self.account:
+                self.switch_account(possible_accounts[0], responder=responder)
+
+    def switch_account(self, account, responder=None):
+        if responder is None: responder = self.ui.write
+        if isinstance(self.account, Account):
+            self.account.sip.register = False
+            self.account.save()
+
+        self.registration_succeeded[self.account.id] = False
+
+        self.account = account
+        responder('Switching account to %s' % self.account.id)
+
+        notification_center = NotificationCenter()
+        notification_center.add_observer(self, sender=account)
+
+        if isinstance(self.account, Account):
+            self.account.sip.register = True
+            self.account.save()
+
+        # self._update_prompt() # Removed TTY-specific prompt update.
+
+    def enroll(self, username, password, email, display_name):
+        settings = SIPSimpleSettings()
+
+        tzname = datetime.now(tzlocal()).tzname() or ""
+
+        post_data = {'password'     : password.encode("utf8"),
+                     'username'     : username.encode("utf8"),
+                     'email'        : email.encode("utf8"),
+                     'display_name' : display_name.encode("utf8"),
+                     'tzinfo'       : tzname }
+
+        return_data = {}
+
+        try:
+            r = requests.post(settings.enrollment.url, timeout=5, data=post_data)
+            settings = SIPSimpleSettings()
+            show_notice("Enrollment request sent to %s" % settings.enrollment.url)
+
+            if r.status_code == 200:
+                body = r.json()
+                if not body["success"]:
+                    return_data['error'] = "Enrollment failed: %s" % body["error_message"]
+                else:
+                    data = defaultdict(lambda: None, body)
+                    sip_address = data['sip_address']
+                    outbound_proxy = data['outbound_proxy']
+
+                    try:
+                        account = Account(sip_address)
+                    except ValueError as e:
+                        return_data['error'] = "Local account create error: %s" % str(e)
+                    else:
+                        account.auth.password = password
+                        account.sip.always_use_my_proxy = True
+                        account.sip.register = True
+                        account.rtp.srtp_encryption = 'opportunistic'
+                        account.nat_traversal.msrp_relay = data['msrp_relay']
+
+                        if data['outbound_proxy']:
+                            account.sip.outbound_proxy = data['outbound_proxy']
+
+                        if data['xcap_root']:
+                            account.xcap.xcap_root = data['xcap_root']
+                            account.xcap.enabled = True
+
+                        account.enabled = True
+                        account.save()
+                        account_manager = AccountManager()
+                        account_manager.default_account = account
+
+                        self.switch_account(account)
+
+                    return_data = data
+            else:
+                return_data['error'] = "Enrollment server error code %s" % r.status_code
+
+        except Exception as e:
+            return_data['error'] = "Enrollment exception: %s" % str(e)
+
+        return return_data
+
+    def _CH_otr(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            message_session = self.message_session(self.message_session_to)
+
+            if not message_session:
+                return
+
+            if message_session.encryption.active:
+                responder("Message encryption will stop")
+                message_session.encryption.stop()
+            else:
+                responder("Message encryption will start")
+                message_session.encryption.start()
+
+            return
+
+        chat_stream = next((stream for stream in self.active_session.streams if stream.type == 'chat'), None)
+
+        if chat_stream is None:
+            return
+
+        if chat_stream.encryption.active:
+            responder("Chat encryption will stop")
+            chat_stream.encryption.stop()
+        else:
+            responder("Chat encryption will start")
+            chat_stream.encryption.start()
+
+    def _CH_otr_secret(self, *args, responder=None):
+        if responder is None: responder = self.ui.write
+        secret = " ".join(args) if args else None
+        if secret is None and self.smp_secret:
+            responder("OTR secret answer is: %s" % self.smp_secret)
+            return
+
+        self.smp_secret = secret
+        responder("OTR secret answer is now set to: %s" % secret)
+
+    def _CH_otr_answer(self, *args, responder=None):
+        if responder is None: responder = self.ui.write
+        answer = " ".join(args) if args else None
+
+        if self.active_session is None:
+            message_session = self.message_session(self.message_session_to)
+
+            if not message_session:
+                responder("OTR functions can be used only during active chat sessions")
+                return
+
+            message_session.encryption.smp_answer(answer.encode())
+
+        else:
+            chat_stream = next((stream for stream in self.active_session.streams if stream.type == 'chat'), None)
+
+            if chat_stream is None:
+                responder("OTR functions can be used only during active chat sessions")
+                return
+
+            if answer:
+                chat_stream.encryption.smp_answer(answer.encode())
+
+    def _CH_otr_question(self, *args, responder=None):
+        if responder is None: responder = self.ui.write
+        question = " ".join(args) if args else None
+
+        if self.smp_secret is None:
+            responder("OTR question can be asked only after secret has been set with /otr_secret")
+            return
+
+        if self.active_session is None:
+            message_session = self.message_session(self.message_session_to)
+
+            if not message_session:
+                responder("OTR functions can be used only during active chat sessions")
+                return
+
+            if question:
+                responder("OTR SMP verification question will be asked for message: %s" % question)
+                message_session.encryption.verified = False
+                message_session.encryption.smp_verify(self.smp_secret.encode(), question=question.encode())
+
+            return
+
+        chat_stream = next((stream for stream in self.active_session.streams if stream.type == 'chat'), None)
+        audio_stream = next((stream for stream in self.active_session.streams if stream.type == 'audio'), None)
+
+        if chat_stream is None:
+            responder("OTR functions can be used only during active chat sessions")
+            return
+
+        if self.smp_secret is None:
+            responder("First set the SMP secret answer using /otr_secret command")
+            return
+
+        if question:
+            responder("OTR SMP verification question will be asked: %s" % question)
+            chat_stream.encryption.verified = False
+            chat_stream.encryption.smp_verify(self.smp_secret.encode(), question=question.encode())
+
+    def _CH_zrtp_verified(self, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            responder("ZRTP functions can be used only during active audio sessions")
+            return
+
+        audio_stream = next((stream for stream in self.active_session.streams if stream.type == 'audio'), None)
+
+        if audio_stream is None:
+            responder("ZRTP functions can be used only during active audio sessions")
+            return
+
+        audio_stream.encryption.zrtp.verified = not audio_stream.encryption.zrtp.verified
+        responder("ZRTP peer is now %s" % ('verified' if audio_stream.encryption.zrtp.verified  else 'not verified'))
+
+    def _CH_zrtp_name(self, *args, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            responder("ZRTP functions can be used only during active audio sessions")
+            return
+
+        audio_stream = next((stream for stream in self.active_session.streams if stream.type == 'audio'), None)
+
+        if audio_stream is None:
+            responder("ZRTP functions can be used only during active audio sessions")
+            return
+
+        peer_name = " ".join(args) if args else None
+        audio_stream.encryption.zrtp.peer_name = peer_name
+        responder("ZRTP peer name is now %s" % audio_stream.encryption.zrtp.peer_name)
+
+    def _CH_hold(self, state='toggle', responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is not None:
+            if state == 'toggle':
+                new_state = not self.active_session.on_hold
+            elif state == 'on':
+                new_state = True
+            elif state == 'off':
+                new_state = False
+            else:
+                responder('Illegal argument to /hold. Type /help for a list of available commands.')
+                return
+            if new_state:
+                self.active_session.hold()
+            else:
+                self.active_session.unhold()
+
+    def _CH_add(self, stream_name, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            responder('There is no active session')
+            return
+        if stream_name in (stream.type for stream in self.active_session.streams):
+            responder('The active session already has a %s stream' % stream_name)
+            return
+        proposal_handler = OutgoingProposalHandler(self.active_session, **{stream_name: True})
+        try:
+            proposal_handler.start()
+        except IllegalStateError:
+            responder('Cannot add a stream while another transaction is in progress')
+
+    def _CH_remove(self, stream_name, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            responder('There is no active session')
+            return
+        try:
+            stream = next((stream for stream in self.active_session.streams if stream.type==stream_name))
+        except StopIteration:
+            responder('The current active session does not have any %s streams' % stream_name)
+        else:
+            try:
+                self.active_session.remove_stream(stream)
+            except IllegalStateError:
+                responder('Cannot remove a stream while another transaction is in progress')
+
+    def _CH_add_participant(self, uri, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            responder('There is no active session')
+            return
+        if re.match('^(sip:|sips:)', uri) is None:
+            uri = 'sip:%s' % uri
+        try:
+            uri = SIPURI.parse(uri)
+        except SIPCoreError:
+            responder('Invalid SIP URI')
+        else:
+            self.active_session.conference.add_participant(uri)
+
+    def _CH_remove_participant(self, uri, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            responder('There is no active session')
+            return
+        if re.match('^(sip:|sips:)', uri) is None:
+            uri = 'sip:%s' % uri
+        try:
+            uri = SIPURI.parse(uri)
+        except SIPCoreError:
+            responder('Invalid SIP URI')
+        else:
+            self.active_session.conference.remove_participant(uri)
+
+    def _CH_transfer(self, uri, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is None:
+            responder('There is no active session')
+            return
+        if re.match('^(sip:|sips:)', uri) is None:
+            uri = 'sip:%s' % uri
+
+        if '@' not in uri:
+            uri = '%s@%s' % (uri, self.account.id.domain)
+
+        try:
+            uri = SIPURI.parse(uri)
+        except SIPCoreError:
+            responder('Invalid SIP URI')
+        else:
+            self.active_session.transfer(uri)
+
+    def _CH_nickname(self, nickname, responder=None):
+        if responder is None: responder = self.ui.write
+        if self.active_session is not None:
+            try:
+                chat_stream = next((stream for stream in self.active_session.streams if stream.type=='chat'))
+            except StopIteration:
+                return
+            try:
+                chat_stream.set_local_nickname(nickname)
+            except Exception as e:
+                responder('Error setting nickname: %s' % e)
+
+    # private methods
+    #
+
+    def _print_help(self, responder=None):
+        if responder is None: responder = self.ui.write
+        lines = []
+        lines.append('General commands:')
+        lines.append('  /account [list|register|user@domain|enroll user password email display_name]: account management')
+        lines.append('  /call {user[@domain]} [+video]: call the specified user using audio and optionally video')
+        lines.append('  /chat {user[@domain]} [+audio]: call the specified user using chat and possibly audio')
+        lines.append('  /conf {room}: join conference room using chat and audio')
+        lines.append('  /[message | m] {user[@domain]}: start a message session')
+        lines.append('  /send {user[@domain]} {file}: initiate a file transfer with the specified user')
+        lines.append('  /next: select the next connected session')
+        lines.append('  /prev: select the previous connected session')
+        lines.append('  /sessions: show the list of connected sessions')
+        if isinstance(self.account, BonjourAccount):
+            lines.append('  /[neighbours | n]: show the list of bonjour neighbours')
+        lines.append('  /trace [[+|-]sip] [[+|-]msrp] [[+|-]pjsip] [[+|-]notifications]: toggle/set tracing on the console')
+        lines.append('  /rtp [on|off]: toggle/set printing RTP statistics and ICE negotiation results on the console')
+        lines.append('  /mute [on|off]: mute the microphone')
+        lines.append('  /camera [device]: change camera device')
+        lines.append('  /input [device]: change audio input device')
+        lines.append('  /output [device]: change audio output device')
+        lines.append('  /alert [device]: change audio alert device')
+        lines.append('  /quit: quit the program')
+        lines.append('  /help: display this help message')
+        lines.append('In call commands:')
+        lines.append('  /hangup: hang-up the active session')
+        lines.append('  /dtmf {0-9|*|#|A-D}...: send DTMF tones')
+        lines.append('  /record [on|off]: toggle/set audio recording')
+        lines.append('  /hold [on|off]: hold/unhold')
+        lines.append('  /zrtp_verified: toggle verified flag for ZRTP peer (both parties must do it)')
+        lines.append('  /zrtp_name name: set name for ZRTP peer')
+        lines.append('  /otr: toggle OTR encryption for the chat stream')
+        lines.append('  /otr_answer answer: Answer OTR verification question using SMP protocol')
+        lines.append('  /otr_secret [secret]: show or set OTR secret')
+        lines.append('  /otr_question question: Ask OTR verification question using SMP protocol')
+        lines.append('  /add {chat|audio}: add a stream to the current session')
+        lines.append('  /remove {chat|audio}: remove a stream from the current session')
+        lines.append('  /add_participant {user@domain}: add the specified user to the conference')
+        lines.append('  /remove_participant {user@domain}: remove the specified user from the conference')
+        lines.append('  /transfer {user@domain}: transfer (using blind transfer) callee to the specified destination')
+        lines.append('  /nickname nick: set the user nickname whithin a conference')
+        responder(lines)
+
+    def _update_prompt(self):
+        # This method is entirely TTY-specific and has been removed.
+        # Its content is replaced with pass or it can be removed if not called.
+        pass
+
+
+def parse_handle_call_option(option, opt_str, value, parser, name):
+    try:
+        value = parser.rargs[0]
+    except IndexError:
+        value = 0
+    else:
+        if value == '' or value[0] == '-':
+            value = 0
+        else:
+            try:
+                value = int(value)
+            except ValueError:
+                value = 0
+            else:
+                del parser.rargs[0]
+    setattr(parser.values, name, value)
+
+
+if __name__ == '__main__':
+    description = '%prog is a command-line client for handling multiple audio, chat and file-transfer sessions'
+    usage = '%prog [options] [user@domain] [filename]'
+    parser = OptionParser(usage=usage, description=description)
+    parser.print_usage = parser.print_help
+    parser.add_option('-a', '--account', type='string', dest='account', help='The account name to use for any outgoing traffic. If not supplied, the default account will be used.', metavar='NAME')
+    parser.add_option('-c', '--config-directory', type='string', dest='config_directory', help='The configuration directory to use. This overrides the default location.')
+    parser.add_option('--playback-dir', type='string', dest='playback_dir', help='Directory with wav files to be played after calling. The destination SIP address is taken from the filename. After playback the call is hangup')
+    parser.add_option('-r', '--auto-record', action='store_true', dest='auto_record', default=False, help='Automatic recording of voice calls.')
+    parser.add_option('-s', '--trace-sip', action='store_true', dest='trace_sip', default=False, help='Dump the raw contents of incoming and outgoing SIP messages.')
+    parser.add_option('-p', '--enable_playback', action='store_true', dest='enable_playback', default=False, help='Enable polling playback directory for new wavs.')
+    parser.add_option('-m', '--trace-msrp', action='store_true', dest='trace_msrp', default=False, help='Dump msrp logging information and the raw contents of incoming and outgoing MSRP messages.')
+    parser.add_option('-j', '--trace-pjsip', action='store_true', dest='trace_pjsip', default=False, help='Print PJSIP logging output.')
+    parser.add_option('-n', '--trace-notifications', action='store_true', dest='trace_notifications', default=False, help='Print all notifications (disabled by default).')
+    parser.add_option('-S', '--disable-sound', action='store_true', dest='disable_sound', default=False, help='Disables initializing the sound card.')
+    parser.add_option('-R', '--auto-reconnect', action='store_true', dest='auto_reconnect', default=False, help='Auto reconnect calls if disconnected by remote.')
+    parser.set_default('auto_answer_interval', None)
+    parser.add_option('--auto-answer', action='callback', callback=parse_handle_call_option, callback_args=('auto_answer_interval',), help='Interval after which to answer an incoming session (disabled by default). If the option is specified but the interval is not, it defaults to 0 (accept the session as soon as it starts ringing).', metavar='[INTERVAL]')
+    parser.set_default('auto_hangup_interval', None)
+    parser.add_option('--auto-hangup', action='callback', callback=parse_handle_call_option, callback_args=('auto_hangup_interval',), help='Interval after which to hang up an established session (disabled by default). If the option is specified but the interval is not, it defaults to 0 (hangup the session as soon as it connects).', metavar='[INTERVAL]')
+    options, args = parser.parse_args()
+
+    target = args[0] if args else None
+    filepath = args[1] if len(args) == 2 else None
+
+    application = SIPSessionApplication()
+    application.start(target, options, filepath)
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    application.stopped_event.wait()
+    sleep(0.1)
