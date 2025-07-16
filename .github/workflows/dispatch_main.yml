@@ -18,4 +18,4 @@ jobs:
           repository: Alarm-System-Gazpromneft/alarm-system
           event-type: submodule-voip-ai-pushed
           client-payload: |
-            { "name": "${{ github.event.head_commit.author }}", "submodule": "alarm-system-voip-ai", "commit": " ${{ github.event.head_commit.message }}" }
+            { "name": "${{ github.actor }}", "submodule": "alarm-system-voip-ai", "commit": " ${{ github.event.head_commit.message }}" }
