@@ -76,10 +76,10 @@ RUN pip install pyttsx3 vosk sounddevice numpy --break-system-packages
 
 COPY sys/sip-session3.py /usr/bin/sip-session3
 COPY sys/ui.py /usr/lib/python3/dist-packages/sipclient/ui.py
-RUN cd /app && wget https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip && unzip vosk-model-ru-0.42.zip 
 
 RUN  chmod +x /usr/bin/sip-session3
 COPY src /app
+RUN cd /app && wget https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip && unzip vosk-model-ru-0.42.zip 
 
 RUN  sip-settings3 --account add 200@fekeniyibklof.beget.app test200
 RUN  sip-settings3 --account default 200@fekeniyibklof.beget.app
