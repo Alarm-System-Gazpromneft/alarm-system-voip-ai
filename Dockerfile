@@ -8,7 +8,7 @@ RUN  echo "deb [trusted=yes] https://packages.ag-projects.com/debian bookworm ma
 RUN  echo "deb-src [trusted=yes] https://packages.ag-projects.com/debian bookworm main" >> /etc/apt/sources.list.d/ag-projects.list
 RUN  apt update && apt install -y sipclients3 python3-sipsimple python3-websockets nano pulseaudio-utils pulseaudio
 
-RUN apt install -y python3-pip libasound-dev libportaudio2 espeak espeak-ng libespeak1
+RUN apt install -y python3-pip libasound-dev libportaudio2 espeak espeak-ng libespeak1 wget
 RUN pip install pyttsx3 vosk sounddevice numpy --break-system-packages
 # ####vosk
 # ARG KALDI_MKL
@@ -76,6 +76,7 @@ RUN pip install pyttsx3 vosk sounddevice numpy --break-system-packages
 
 COPY sys/sip-session3.py /usr/bin/sip-session3
 COPY sys/ui.py /usr/lib/python3/dist-packages/sipclient/ui.py
+RUN cd /app && wget https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip && unzip vosk-model-ru-0.42.zip 
 
 RUN  chmod +x /usr/bin/sip-session3
 COPY src /app
